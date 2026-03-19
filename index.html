@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SoraFetch — Sora Video Downloader</title>
+<link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@300;400;500&family=DM+Sans:ital,wght@0,300;0,400;0,500;1,400&display=swap" rel="stylesheet">
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #050507;
+    --surface: #0d0d12;
+    --card: #111118;
+    --border: rgba(255,255,255,0.07);
+    --border-lit: rgba(99,179,255,0.35);
+    --accent: #3d9fff;
+    --accent2: #7b5cff;
+    --accent-glow: rgba(61,159,255,0.15);
+    --text: #e8eaf0;
+    --muted: #626775;
+    --success: #3dffaa;
+    --error: #ff5f6d;
+    --radius: 14px;
+    --api: http://localhost:8000;
+  }
+
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'DM Sans', sans-serif;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  body::before {
+    content: '';
+    position: fixed; inset: 0;
+    background-image:
+      linear-gradient(rgba(61,159,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(61,159,255,0.025) 1px, transparent 1px);
+    background-size: 44px 44px;
+    pointer-events: none; z-index: 0;
+  }
+  body::after {
+    content: '';
+    position: fixed; top: -15%; left: 50%;
+    transform: translateX(-50%);
+    width: 900px; height: 500px;
+    background: radial-gradient(ellipse, rgba(61,159,255,0.055) 0%, transparent 70%);
+    pointer-events: none; z-index: 0;
+  }
+
+  .wrap {
+    position: relative; z-index: 1;
+    max-width: 880px; margin: 0 auto;
+    padding: 0 20px 80px;
+  }
+
+  /* ─── Header ─── */
+  header {
+    padding: 56px 0 32px;
+    text-align: center;
+    animation: fadeDown 0.65s ease both;
+  }
+
+  .logo {
+    display: inline-flex; align-items: center; gap: 10px;
+    margin-bottom: 22px;
+  }
+  .logo-icon {
+    width: 42px; height: 42px;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    border-radius: 11px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 20px;
+    box-shadow: 0 0 28px rgba(61,159,255,0.3);
+  }
+  .logo-text {
+    font-family: 'Syne', sans-serif; font-size: 22px; font-weight: 800;
+    letter-spacing: -0.5px;
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  h1 {
+    font-family: 'Syne', sans-serif;
+    font-size: clamp(26px, 5.5vw, 50px);
+    font-weight: 800; line-height: 1.08; letter-spacing: -2px;
+    margin-bottom: 16px;
+  }
+  h1 span {
+    background: linear-gradient(90deg, var(--accent) 0%, var(--accent2) 100%);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .subtitle {
+    color: var(--muted); font-size: 15px; font-weight: 300;
+    max-width: 430px; margin: 0 auto; line-height: 1.65;
+  }
+
+  /* ─── API config bar ─── */
+  .api-bar {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 10px 14px;
+    margin: 28px 0 0;
+    animation: fadeUp 0.6s 0.05s ease both;
+  }
+  .api-bar label {
+    font-family: 'DM Mono', monospace; font-size: 11px;
+    color: var(--muted); white-space: nowrap; flex-shrink: 0;
+  }
+  .api-input {
+    flex: 1; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 7px; padding: 7px 11px; color: var(--text);
+    font-family: 'DM Mono', monospace; font-size: 12px; outline: none;
+    transition: border-color 0.2s;
+  }
+  .api-input:focus { border-color: var(--border-lit); }
+  .api-status {
+    font-family: 'DM Mono', monospace; font-size: 11px;
+    padding: 4px 10px; border-radius: 999px; flex-shrink: 0;
+  }
+  .api-status.online { background: rgba(61,255,170,0.1); color: var(--success); border: 1px solid rgba(61,255,170,0.2); }
+  .api-status.offline { background: rgba(255,95,109,0.1); color: var(--error); border: 1px solid rgba(255,95,109,0.2); }
+  .api-status.checking { background: rgba(61,159,255,0.1); color: var(--accent); border: 1px solid rgba(61,159,255,0.2); }
+
+  /* ─── Tabs ─── */
+  .tabs {
+    display: flex; gap: 4px;
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 4px; margin: 14px 0 0;
+    animation: fadeUp 0.6s 0.12s ease both;
+  }
+  .tab {
+    flex: 1; padding: 10px 0;
+    background: transparent; border: none; border-radius: 9px;
+    color: var(--muted); font-family: 'DM Sans', sans-serif;
+    font-size: 13.5px; font-weight: 500; cursor: pointer;
+    transition: all 0.2s;
+    display: flex; align-items: center; justify-content: center; gap: 7px;
+  }
+  .tab.active {
+    background: rgba(61,159,255,0.11); color: var(--accent);
+    border: 1px solid var(--border-lit);
+  }
+  .tab:hover:not(.active) { color: var(--text); }
+
+  /* ─── Cards ─── */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 24px;
+    margin-top: 14px; animation: fadeUp 0.6s 0.18s ease both;
+  }
+  .card-title {
+    font-family: 'Syne', sans-serif; font-size: 11.5px; font-weight: 700;
+    letter-spacing: 1.6px; text-transform: uppercase; color: var(--muted);
+    margin-bottom: 13px;
+  }
+
+  /* ─── Inputs ─── */
+  .input-row { display: flex; gap: 10px; align-items: stretch; }
+
+  .url-input {
+    flex: 1; background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 12px 15px; color: var(--text);
+    font-family: 'DM Mono', monospace; font-size: 13px; outline: none;
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .url-input::placeholder { color: var(--muted); }
+  .url-input:focus { border-color: var(--border-lit); box-shadow: 0 0 0 3px var(--accent-glow); }
+
+  .url-textarea {
+    width: 100%; resize: vertical; min-height: 128px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 10px; padding: 13px 15px; color: var(--text);
+    font-family: 'DM Mono', monospace; font-size: 12.5px; line-height: 1.75;
+    outline: none; transition: border-color 0.2s, box-shadow 0.2s;
+    margin-bottom: 12px;
+  }
+  .url-textarea::placeholder { color: var(--muted); }
+  .url-textarea:focus { border-color: var(--border-lit); box-shadow: 0 0 0 3px var(--accent-glow); }
+
+  /* ─── Buttons ─── */
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 12px 20px; border-radius: 10px;
+    font-family: 'DM Sans', sans-serif; font-size: 14px; font-weight: 500;
+    cursor: pointer; border: none; transition: all 0.2s; white-space: nowrap;
+  }
+  .btn-primary {
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    color: #fff; box-shadow: 0 0 18px rgba(61,159,255,0.25);
+  }
+  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 28px rgba(61,159,255,0.42); }
+  .btn-primary:active { transform: translateY(0); }
+  .btn-secondary {
+    background: rgba(255,255,255,0.05); color: var(--text);
+    border: 1px solid var(--border);
+  }
+  .btn-secondary:hover { background: rgba(255,255,255,0.08); }
+  .btn-danger {
+    background: rgba(255,95,109,0.08); color: var(--error);
+    border: 1px solid rgba(255,95,109,0.18);
+  }
+  .btn-danger:hover { background: rgba(255,95,109,0.14); }
+  .btn:disabled { opacity: 0.42; cursor: not-allowed; transform: none !important; box-shadow: none !important; }
+  .btn-row { display: flex; gap: 10px; flex-wrap: wrap; }
+
+  /* ─── Panels ─── */
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* ─── Options row ─── */
+  .options-row {
+    display: flex; gap: 16px; flex-wrap: wrap;
+    margin-top: 14px; padding-top: 14px;
+    border-top: 1px solid var(--border);
+    font-size: 13px;
+  }
+  .opt-label {
+    display: flex; align-items: center; gap: 7px;
+    color: var(--muted); cursor: pointer; user-select: none;
+  }
+  .opt-label input[type=checkbox] {
+    accent-color: var(--accent);
+    width: 15px; height: 15px; cursor: pointer;
+  }
+
+  /* ─── Queue ─── */
+  #queue-section { margin-top: 28px; animation: fadeUp 0.5s ease both; }
+
+  .queue-header {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 12px;
+  }
+  .queue-label {
+    font-family: 'Syne', sans-serif; font-size: 11.5px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 1.5px; color: var(--muted);
+  }
+  .queue-meta { display: flex; align-items: center; gap: 8px; }
+  .queue-count { font-family: 'DM Mono', monospace; font-size: 12px; color: var(--accent); }
+
+  .queue-list { display: flex; flex-direction: column; gap: 9px; }
+
+  /* ─── Queue item ─── */
+  .q-item {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 11px; padding: 14px 16px;
+    transition: border-color 0.25s; position: relative; overflow: hidden;
+  }
+  .q-item.status-downloading { border-color: rgba(61,159,255,0.28); }
+  .q-item.status-done        { border-color: rgba(61,255,170,0.22); }
+  .q-item.status-error       { border-color: rgba(255,95,109,0.28); }
+
+  .q-top { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+
+  .q-icon {
+    width: 34px; height: 34px; border-radius: 8px;
+    display: flex; align-items: center; justify-content: center; font-size: 15px; flex-shrink: 0;
+  }
+  .q-icon.pending      { background: rgba(100,107,130,0.12); }
+  .q-icon.fetching     { background: rgba(61,159,255,0.1); }
+  .q-icon.downloading  { background: rgba(61,159,255,0.1); }
+  .q-icon.done         { background: rgba(61,255,170,0.1); }
+  .q-icon.error        { background: rgba(255,95,109,0.1); }
+
+  .q-info { flex: 1; min-width: 0; }
+  .q-url {
+    font-family: 'DM Mono', monospace; font-size: 11px; color: var(--muted);
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-bottom: 3px;
+  }
+  .q-statustext { font-size: 12px; font-weight: 500; }
+  .q-statustext.pending     { color: var(--muted); }
+  .q-statustext.fetching    { color: #ffb830; }
+  .q-statustext.downloading { color: var(--accent); }
+  .q-statustext.done        { color: var(--success); }
+  .q-statustext.error       { color: var(--error); }
+
+  .q-actions { display: flex; gap: 6px; align-items: center; flex-shrink: 0; }
+  .q-btn {
+    background: none; border: none; cursor: pointer;
+    font-size: 14px; padding: 5px; border-radius: 6px;
+    color: var(--muted); transition: color 0.2s, background 0.2s; line-height: 1;
+  }
+  .q-btn:hover { color: var(--error); background: rgba(255,95,109,0.1); }
+  .q-btn.retry:hover { color: var(--accent); background: rgba(61,159,255,0.1); }
+
+  /* Progress */
+  .progress-track {
+    height: 3px; background: rgba(255,255,255,0.06);
+    border-radius: 999px; overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; border-radius: 999px; transition: width 0.35s ease;
+  }
+  .progress-fill.downloading { background: linear-gradient(90deg, var(--accent), var(--accent2)); animation: pglow 1.4s infinite; }
+  .progress-fill.fetching    { background: #ffb830; animation: pglow 1s infinite; }
+  .progress-fill.done        { background: var(--success); }
+  .progress-fill.error       { background: var(--error); width: 100% !important; }
+
+  @keyframes pglow { 0%,100%{filter:brightness(1)} 50%{filter:brightness(1.5)} }
+
+  .progress-meta {
+    display: flex; justify-content: space-between; margin-top: 6px;
+    font-family: 'DM Mono', monospace; font-size: 10.5px; color: var(--muted);
+  }
+
+  /* ─── Stats ─── */
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px;
+    margin-top: 26px; animation: fadeUp 0.7s 0.28s ease both;
+  }
+  .stat-card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px 14px; text-align: center;
+  }
+  .stat-value {
+    font-family: 'Syne', sans-serif; font-size: 24px; font-weight: 800;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    line-height: 1; margin-bottom: 4px;
+  }
+  .stat-label { font-size: 10.5px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 0.8px; }
+
+  /* ─── Info box ─── */
+  .info-box {
+    display: flex; gap: 10px; align-items: flex-start;
+    background: rgba(255,184,48,0.05); border: 1px solid rgba(255,184,48,0.16);
+    border-radius: 10px; padding: 13px 14px; margin-top: 14px;
+    font-size: 12.5px; color: rgba(255,195,80,0.8); line-height: 1.55;
+    animation: fadeUp 0.6s 0.3s ease both;
+  }
+  .info-box .icon { font-size: 15px; flex-shrink: 0; margin-top: 1px; }
+  code { background: rgba(255,255,255,0.07); padding: 1px 5px; border-radius: 4px; font-family: 'DM Mono', monospace; font-size: 11px; }
+
+  /* ─── Toast ─── */
+  .toast-wrap { position: fixed; bottom: 22px; right: 22px; display: flex; flex-direction: column; gap: 7px; z-index: 999; }
+  .toast {
+    background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+    padding: 11px 16px; font-size: 13px; font-weight: 500;
+    animation: toastIn 0.3s ease; max-width: 300px;
+    box-shadow: 0 8px 30px rgba(0,0,0,0.5);
+  }
+  .toast.success { border-color: rgba(61,255,170,0.28); color: var(--success); }
+  .toast.error   { border-color: rgba(255,95,109,0.28); color: var(--error); }
+  .toast.info    { border-color: rgba(61,159,255,0.28); color: var(--accent); }
+  .toast.warn    { border-color: rgba(255,184,48,0.28); color: #ffb830; }
+
+  /* ─── Animations ─── */
+  @keyframes fadeDown { from { opacity:0; transform:translateY(-14px); } to { opacity:1; transform:translateY(0); } }
+  @keyframes fadeUp   { from { opacity:0; transform:translateY(12px);  } to { opacity:1; transform:translateY(0); } }
+  @keyframes toastIn  { from { opacity:0; transform:translateY(10px);  } to { opacity:1; transform:translateY(0); } }
+  @keyframes spin     { to { transform: rotate(360deg); } }
+  .spin { display: inline-block; animation: spin 0.75s linear infinite; }
+
+  /* ─── Responsive ─── */
+  @media (max-width: 620px) {
+    .input-row { flex-direction: column; }
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    .btn-row { flex-direction: column; }
+    .api-bar { flex-wrap: wrap; }
+  }
+  @media (max-width: 360px) {
+    .stats { grid-template-columns: 1fr 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <!-- Header -->
+  <header>
+    <div class="logo">
+      <div class="logo-icon">⬇</div>
+      <span class="logo-text">SoraFetch</span>
+    </div>
+    <h1>Download <span>Sora Videos</span><br>Without Watermark</h1>
+    <p class="subtitle">Paste one or many Sora video links. Backend proxy fetches &amp; streams them directly to you.</p>
+  </header>
+
+  <!-- API config bar -->
+  <div class="api-bar">
+    <label for="api-url">🔗 API SERVER</label>
+    <input class="api-input" id="api-url" type="text" value="http://localhost:8000" placeholder="http://localhost:8000" oninput="debouncedCheck()" />
+    <span class="api-status checking" id="api-status">⏳ Checking...</span>
+  </div>
+
+  <!-- Tabs -->
+  <div class="tabs">
+    <button class="tab active" onclick="switchTab('single', this)">🎬 Single URL</button>
+    <button class="tab" onclick="switchTab('batch', this)">📦 Batch Download</button>
+  </div>
+
+  <!-- Single panel -->
+  <div id="panel-single" class="panel active">
+    <div class="card">
+      <div class="card-title">Sora Video URL</div>
+      <div class="input-row">
+        <input class="url-input" id="single-url" type="text"
+          placeholder="https://sora.com/videos/..."
+          onkeydown="if(event.key==='Enter') addSingle()" />
+        <button class="btn btn-primary" id="single-btn" onclick="addSingle()">⬇ Download</button>
+      </div>
+      <div class="options-row">
+        <label class="opt-label"><input type="checkbox" id="opt-info" /> Fetch info first</label>
+        <label class="opt-label"><input type="checkbox" id="opt-nomark" checked /> Remove watermark area</label>
+      </div>
+    </div>
+  </div>
+
+  <!-- Batch panel -->
+  <div id="panel-batch" class="panel">
+    <div class="card">
+      <div class="card-title">Batch URLs — one per line (max 50)</div>
+      <textarea class="url-textarea" id="batch-urls"
+        placeholder="https://sora.com/videos/abc123&#10;https://sora.com/videos/def456&#10;https://sora.com/videos/ghi789"></textarea>
+      <div class="btn-row">
+        <button class="btn btn-primary" onclick="addBatch()">📦 Add All to Queue</button>
+        <button class="btn btn-secondary" onclick="prefetchBatch()">🔍 Fetch Info First</button>
+        <button class="btn btn-danger" onclick="clearBatch()">🗑 Clear</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Info box -->
+  <div class="info-box">
+    <span class="icon">ℹ️</span>
+    <div>
+      Start your FastAPI backend first: <code>uvicorn main:app --reload</code>. Then paste Sora video URLs. The backend fetches videos server-side — bypassing browser CORS restrictions completely.
+    </div>
+  </div>
+
+  <!-- Queue -->
+  <div id="queue-section" style="display:none">
+    <div class="queue-header">
+      <span class="queue-label">Download Queue</span>
+      <div class="queue-meta">
+        <span class="queue-count" id="queue-count">0 items</span>
+        <button class="btn btn-secondary" style="padding:5px 11px;font-size:12px;" onclick="clearDoneItems()">Clear Done</button>
+        <button class="btn btn-danger" style="padding:5px 11px;font-size:12px;" onclick="clearQueue()">Clear All</button>
+      </div>
+    </div>
+    <div class="queue-list" id="queue-list"></div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats">
+    <div class="stat-card">
+      <div class="stat-value" id="stat-total">0</div>
+      <div class="stat-label">Total</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="stat-active" style="background:linear-gradient(135deg,#3d9fff,#7b5cff);-webkit-background-clip:text;-webkit-text-fill-color:transparent">0</div>
+      <div class="stat-label">Active</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="stat-done" style="background:linear-gradient(135deg,#3dffaa,#00d47e);-webkit-background-clip:text;-webkit-text-fill-color:transparent">0</div>
+      <div class="stat-label">Done</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value" id="stat-err" style="background:linear-gradient(135deg,#ff5f6d,#ff8c6c);-webkit-background-clip:text;-webkit-text-fill-color:transparent">0</div>
+      <div class="stat-label">Failed</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Toasts -->
+<div class="toast-wrap" id="toasts"></div>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────
+function apiBase() {
+  return document.getElementById('api-url').value.replace(/\/$/, '') || 'http://localhost:8000';
+}
+
+// ── State ─────────────────────────────────────────────────────────────
+let queue = [];
+let idCounter = 0;
+let activeDownloads = 0;
+const MAX_CONCURRENT = 3;
+
+// ── API Health Check ──────────────────────────────────────────────────
+async function checkAPIHealth() {
+  const el = document.getElementById('api-status');
+  el.className = 'api-status checking'; el.textContent = '⏳ Checking...';
+  try {
+    const r = await fetch(apiBase() + '/health', { signal: AbortSignal.timeout(4000) });
+    if (r.ok) {
+      el.className = 'api-status online'; el.textContent = '✓ Online';
+    } else throw new Error('bad status');
+  } catch {
+    el.className = 'api-status offline'; el.textContent = '✕ Offline';
+  }
+}
+
+let checkTimer;
+function debouncedCheck() {
+  clearTimeout(checkTimer);
+  checkTimer = setTimeout(checkAPIHealth, 700);
+}
+
+checkAPIHealth();
+setInterval(checkAPIHealth, 30000);
+
+// ── Tab ───────────────────────────────────────────────────────────────
+function switchTab(name, btn) {
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  btn.classList.add('active');
+  document.getElementById('panel-' + name).classList.add('active');
+}
+
+// ── URL helpers ───────────────────────────────────────────────────────
+function isValidURL(url) {
+  try { const u = new URL(url.trim()); return ['http:', 'https:'].includes(u.protocol); }
+  catch { return false; }
+}
+function cleanURL(url) { return url.trim(); }
+
+// ── Add single ────────────────────────────────────────────────────────
+async function addSingle() {
+  const input = document.getElementById('single-url');
+  const url = cleanURL(input.value);
+  if (!url) { toast('Koi URL paste karein.', 'error'); return; }
+  if (!isValidURL(url)) { toast('URL format sahi nahi hai.', 'error'); return; }
+
+  const fetchInfoFirst = document.getElementById('opt-info').checked;
+  addToQueue([url], fetchInfoFirst);
+  input.value = '';
+}
+
+// ── Batch ─────────────────────────────────────────────────────────────
+async function addBatch() {
+  const raw = document.getElementById('batch-urls').value;
+  const lines = raw.split('\n').map(cleanURL).filter(l => l);
+  if (!lines.length) { toast('Koi URL nahi mili.', 'error'); return; }
+  const valid = lines.filter(isValidURL);
+  const bad = lines.length - valid.length;
+  if (!valid.length) { toast('Koi valid URL nahi.', 'error'); return; }
+  if (bad > 0) toast(`${bad} invalid URL(s) skip ho gayi.`, 'warn');
+  if (valid.length > 50) { toast('Max 50 URLs allowed.', 'warn'); valid.splice(50); }
+  addToQueue(valid, false);
+  document.getElementById('batch-urls').value = '';
+}
+
+async function prefetchBatch() {
+  const raw = document.getElementById('batch-urls').value;
+  const lines = raw.split('\n').map(cleanURL).filter(l => l);
+  const valid = lines.filter(isValidURL);
+  if (!valid.length) { toast('Koi valid URL nahi.', 'error'); return; }
+  addToQueue(valid, true);
+  document.getElementById('batch-urls').value = '';
+}
+
+function clearBatch() { document.getElementById('batch-urls').value = ''; }
+
+// ── Queue management ──────────────────────────────────────────────────
+function addToQueue(urls, fetchInfo = false) {
+  const items = urls.map(url => ({
+    id: ++idCounter, url,
+    status: 'pending', progress: 0,
+    size: null, sizeHuman: null, speed: '—',
+    filename: null, error: null, fetchInfo,
+  }));
+  queue.push(...items);
+  renderQueue();
+  processQueue();
+  toast(`${urls.length} video${urls.length > 1 ? 's' : ''} queue mein add ho gayi.`, 'success');
+}
+
+function removeItem(id) { queue = queue.filter(i => i.id !== id); renderQueue(); updateStats(); }
+
+function clearDoneItems() {
+  queue = queue.filter(i => i.status !== 'done' && i.status !== 'error');
+  renderQueue(); updateStats();
+}
+
+function clearQueue() {
+  queue = queue.filter(i => i.status === 'downloading' || i.status === 'fetching');
+  renderQueue(); updateStats();
+  if (!queue.length) document.getElementById('queue-section').style.display = 'none';
+}
+
+function retryItem(id) {
+  const item = queue.find(i => i.id === id);
+  if (!item) return;
+  item.status = 'pending'; item.progress = 0; item.error = null;
+  renderItem(item); processQueue();
+}
+
+// ── Downloader ────────────────────────────────────────────────────────
+function processQueue() {
+  const slots = MAX_CONCURRENT - activeDownloads;
+  const pending = queue.filter(i => i.status === 'pending').slice(0, slots);
+  pending.forEach(startDownload);
+}
+
+async function startDownload(item) {
+  if (item.status !== 'pending') return;
+  activeDownloads++;
+
+  // Step 1: optionally fetch info
+  if (item.fetchInfo) {
+    item.status = 'fetching'; item.progress = 5;
+    renderItem(item);
+    try {
+      const r = await fetch(`${apiBase()}/info?url=${encodeURIComponent(item.url)}`);
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      item.filename = data.filename;
+      item.sizeHuman = data.size_human;
+      item.progress = 15;
+    } catch (e) {
+      // Non-fatal — continue anyway
+      item.progress = 10;
+    }
+  }
+
+  // Step 2: download via backend
+  item.status = 'downloading'; item.progress = item.fetchInfo ? 20 : 5;
+  renderItem(item);
+
+  try {
+    const filename = item.filename || guessFilename(item.url);
+    const downloadURL = `${apiBase()}/download?url=${encodeURIComponent(item.url)}&filename=${encodeURIComponent(filename)}`;
+
+    // Use fetch with streaming to show progress
+    const resp = await fetch(downloadURL);
+    if (!resp.ok) {
+      const err = await resp.text();
+      throw new Error(`Server error: ${resp.status} — ${err}`);
+    }
+
+    const contentLength = resp.headers.get('content-length');
+    const total = contentLength ? parseInt(contentLength) : null;
+
+    const reader = resp.body.getReader();
+    const chunks = [];
+    let received = 0;
+    const t0 = Date.now();
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
+      const elapsed = (Date.now() - t0) / 1000 || 0.001;
+      item.speed = formatBytes(received / elapsed) + '/s';
+      item.sizeHuman = item.sizeHuman || (total ? formatBytes(total) : null);
+      item.progress = total
+        ? Math.min(95, 20 + Math.round((received / total) * 75))
+        : Math.min(90, item.progress + 2);
+      renderItem(item);
+    }
+
+    item.progress = 100;
+    const blob = new Blob(chunks, { type: 'video/mp4' });
+    triggerSave(blob, filename);
+
+    item.status = 'done'; item.speed = null;
+    renderItem(item);
+    toast(`✓ Download complete: ${filename}`, 'success');
+
+  } catch (err) {
+    item.status = 'error'; item.error = err.message || 'Unknown error'; item.progress = 0;
+    renderItem(item);
+    toast(`✕ Error: ${item.error.slice(0, 60)}`, 'error');
+  }
+
+  activeDownloads--;
+  updateStats();
+  processQueue();
+}
+
+function triggerSave(blob, filename) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(a.href), 15000);
+}
+
+function guessFilename(url) {
+  try {
+    const parts = new URL(url).pathname.split('/').filter(Boolean);
+    const last = parts[parts.length - 1] || 'sora-video';
+    return last.includes('.') ? last : last + '.mp4';
+  } catch { return 'sora-video.mp4'; }
+}
+
+// ── Rendering ─────────────────────────────────────────────────────────
+function renderQueue() {
+  const section = document.getElementById('queue-section');
+  const list = document.getElementById('queue-list');
+  document.getElementById('queue-count').textContent = `${queue.length} item${queue.length !== 1 ? 's' : ''}`;
+  if (!queue.length) { section.style.display = 'none'; return; }
+  section.style.display = 'block';
+  list.innerHTML = '';
+  queue.forEach(item => {
+    const el = document.createElement('div');
+    el.id = 'qi-' + item.id;
+    list.appendChild(el);
+    _fill(item, el);
+  });
+  updateStats();
+}
+
+function renderItem(item) {
+  const el = document.getElementById('qi-' + item.id);
+  if (el) _fill(item, el);
+  updateStats();
+}
+
+function _fill(item, el) {
+  const ICONS = { pending: '⏳', fetching: '🔍', downloading: '⬇', done: '✓', error: '✕' };
+  const LABELS = {
+    pending:     'Waiting in queue...',
+    fetching:    'Fetching video info...',
+    downloading: `Downloading${item.speed ? ' · ' + item.speed : ''}`,
+    done:        `Downloaded${item.sizeHuman ? ' · ' + item.sizeHuman : ''}`,
+    error:       item.error || 'Failed',
+  };
+  const fillCls = { pending:'downloading', fetching:'fetching', downloading:'downloading', done:'done', error:'error' }[item.status];
+  const pct = item.status === 'done' ? 100 : item.status === 'error' ? 0 : item.progress;
+
+  el.className = `q-item status-${item.status}`;
+  el.innerHTML = `
+    <div class="q-top">
+      <div class="q-icon ${item.status}">${ICONS[item.status]}</div>
+      <div class="q-info">
+        <div class="q-url" title="${item.url}">${item.url}</div>
+        <div class="q-statustext ${item.status}">${LABELS[item.status]}</div>
+      </div>
+      <div class="q-actions">
+        ${item.status === 'error' ? `<button class="q-btn retry" title="Retry" onclick="retryItem(${item.id})">↺</button>` : ''}
+        ${item.status !== 'downloading' && item.status !== 'fetching'
+          ? `<button class="q-btn" title="Remove" onclick="removeItem(${item.id})">×</button>` : ''}
+      </div>
+    </div>
+    <div class="progress-track">
+      <div class="progress-fill ${fillCls}" style="width:${pct}%"></div>
+    </div>
+    <div class="progress-meta">
+      <span>${item.sizeHuman || ''}</span>
+      <span>${item.status === 'done' ? '100%' : item.status === 'error' ? 'Error' : item.status === 'pending' ? 'Queued' : pct + '%'}</span>
+    </div>
+  `;
+}
+
+function updateStats() {
+  document.getElementById('stat-total').textContent  = queue.length;
+  document.getElementById('stat-active').textContent = queue.filter(i => i.status === 'downloading' || i.status === 'fetching').length;
+  document.getElementById('stat-done').textContent   = queue.filter(i => i.status === 'done').length;
+  document.getElementById('stat-err').textContent    = queue.filter(i => i.status === 'error').length;
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────
+function formatBytes(b) {
+  if (b < 1024) return b.toFixed(0) + ' B';
+  if (b < 1048576) return (b/1024).toFixed(1) + ' KB';
+  if (b < 1073741824) return (b/1048576).toFixed(1) + ' MB';
+  return (b/1073741824).toFixed(2) + ' GB';
+}
+
+function toast(msg, type = 'info') {
+  const wrap = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = `toast ${type}`; el.textContent = msg;
+  wrap.appendChild(el);
+  setTimeout(() => { el.style.transition = 'opacity 0.35s'; el.style.opacity = '0'; setTimeout(() => el.remove(), 380); }, 3500);
+}
+
+// ── Init ──────────────────────────────────────────────────────────────
+updateStats();
+</script>
+</body>
+</html>
