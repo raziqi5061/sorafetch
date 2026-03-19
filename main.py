@@ -1,6 +1,6 @@
 """
-SoraFetch - FastAPI Backend v3
-Sora share link API extraction + direct video streaming
+SoraFetch - FastAPI Backend v5
+Fliflik session-based extraction (visits page first to get cookies, then calls API)
 """
 
 import json
@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="SoraFetch API", version="3.0.0")
+app = FastAPI(title="SoraFetch API", version="5.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -25,35 +25,6 @@ app.add_middleware(
 )
 
 CHUNK_SIZE = 1024 * 512
-
-# Browser headers — mimic real Chrome as closely as possible
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "identity",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Upgrade-Insecure-Requests": "1",
-}
-
-API_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "identity",
-    "Referer": "https://sora.chatgpt.com/",
-    "Origin": "https://sora.chatgpt.com",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-}
 
 VIDEO_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -66,8 +37,6 @@ VIDEO_HEADERS = {
 class BatchRequest(BaseModel):
     urls: list[str]
 
-
-# ─── Helpers ───────────────────────────────────────────────────────────
 
 def format_bytes(size: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -90,218 +59,252 @@ def guess_filename(url: str, share_id: str = None) -> str:
 
 
 def extract_share_id(url: str) -> Optional[str]:
-    """Extract share ID from Sora URL like /p/s_abc123"""
-    match = re.search(r'/p/(s_[a-f0-9]+)', url, re.I)
-    if match:
-        return match.group(1)
-    match = re.search(r'/videos?/(s_[a-f0-9]+)', url, re.I)
-    if match:
-        return match.group(1)
+    m = re.search(r'/p/(s_[a-f0-9]+)', url, re.I)
+    if m:
+        return m.group(1)
+    m = re.search(r'/videos?/(s_[a-f0-9]+)', url, re.I)
+    if m:
+        return m.group(1)
     return None
 
 
 def is_direct_video(url: str) -> bool:
-    url_lower = url.lower()
-    return any(ext in url_lower for ext in (".mp4", ".webm", ".mov", ".m4v"))
+    return any(ext in url.lower() for ext in (".mp4", ".webm", ".mov", ".m4v"))
 
 
-# ─── Core: Sora API extraction ─────────────────────────────────────────
+def extract_video_from_response(text: str) -> Optional[str]:
+    """Extract video URL from any response text/JSON."""
+    # Try JSON parse first
+    try:
+        data = json.loads(text)
+        # Direct fields
+        for key in ("url", "video_url", "download_url", "link", "source",
+                    "videoUrl", "downloadUrl", "file_url", "stream_url"):
+            val = data.get(key)
+            if val and isinstance(val, str) and val.startswith("http"):
+                return val
+        # Nested
+        for key in ("data", "result", "video", "response"):
+            sub = data.get(key)
+            if isinstance(sub, dict):
+                for k2 in ("url", "video_url", "download_url", "link"):
+                    val = sub.get(k2)
+                    if val and isinstance(val, str) and val.startswith("http"):
+                        return val
+        # Search entire JSON string
+        data_str = json.dumps(data)
+        for pattern in [
+            r'https://videos\.openai\.com[^"\'\\]+',
+            r'https://[^"\'\\]*oaiusercontent[^"\'\\]+',
+            r'https://cdn\.openai\.com[^"\'\\]+\.mp4[^"\'\\]*',
+            r'https://[^"\'\\]+\.mp4[^"\'\\]*',
+        ]:
+            m = re.search(pattern, data_str)
+            if m:
+                return m.group(0).replace('\\u0026', '&').replace('\\/','/')
+    except Exception:
+        pass
 
-async def try_sora_api(share_id: str, client: httpx.AsyncClient) -> Optional[str]:
-    """
-    Try Sora's internal API endpoints to get the direct video URL.
-    These are the endpoints that tools like fliflik use.
-    """
-
-    # Endpoint patterns Sora uses internally for share links
-    api_endpoints = [
-        f"https://sora.chatgpt.com/backend-api/video_generations/{share_id}",
-        f"https://sora.chatgpt.com/api/video/{share_id}",
-        f"https://sora.chatgpt.com/api/share/{share_id}",
-        f"https://sora.chatgpt.com/api/videos/{share_id}",
-        f"https://sora.chatgpt.com/backend-api/videos/{share_id}",
-        f"https://sora.chatgpt.com/public-api/video/{share_id}",
-        f"https://sora.chatgpt.com/v1/video/{share_id}",
-    ]
-
-    for endpoint in api_endpoints:
-        try:
-            resp = await client.get(endpoint, headers=API_HEADERS, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                # Look for video URL in common JSON field names
-                video_url = (
-                    data.get("video_url") or
-                    data.get("url") or
-                    data.get("source_url") or
-                    data.get("asset_url") or
-                    data.get("download_url") or
-                    data.get("file_url") or
-                    (data.get("video", {}) or {}).get("url") or
-                    (data.get("result", {}) or {}).get("url") or
-                    (data.get("data", {}) or {}).get("url")
-                )
-                if video_url and ("http" in video_url):
-                    return video_url
-                # Search recursively in JSON
-                data_str = json.dumps(data)
-                mp4_match = re.search(r'https://[^"\'\\]+\.mp4[^"\'\\]*', data_str)
-                if mp4_match:
-                    return mp4_match.group(0)
-        except Exception:
-            continue
+    # Raw text search
+    for pattern in [
+        r'https://videos\.openai\.com[^"\'<>\s\\]+',
+        r'https://[^"\'<>\s\\]*oaiusercontent[^"\'<>\s\\]+',
+        r'https://cdn\.openai\.com[^"\'<>\s\\]+\.mp4[^"\'<>\s\\]*',
+        r'https://[^"\'<>\s\\]+\.mp4[^"\'<>\s\\]*',
+    ]:
+        m = re.search(pattern, text)
+        if m:
+            return m.group(0).replace('\\u0026', '&').replace('\\/', '/')
 
     return None
 
 
-async def try_page_scrape(url: str, client: httpx.AsyncClient) -> Optional[str]:
+async def try_fliflik(sora_url: str) -> Optional[str]:
     """
-    Fetch the share page HTML and extract video URL using multiple strategies.
+    Full fliflik session flow:
+    1. Visit fliflik page → get cookies + any CSRF token
+    2. POST to /get-video-link with session cookies
     """
+    base_url = "https://online.fliflik.com"
+    page_url = f"{base_url}/sora-video-downloader/"
+    api_url  = f"{base_url}/get-video-link"
+
+    # Use a persistent cookie jar so session is maintained
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        timeout=30,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    ) as client:
+
+        # Step 1 — visit page to get session cookies
+        try:
+            page_resp = await client.get(page_url, headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Sec-Fetch-Dest": "document",
+                "Sec-Fetch-Mode": "navigate",
+                "Sec-Fetch-Site": "none",
+            })
+        except Exception:
+            pass  # Even if page fails, try API anyway
+
+        # Extract CSRF token from page if present
+        csrf_token = None
+        try:
+            html = page_resp.text
+            for pattern in [
+                r'csrf[_-]token["\s:=]+["\']([^"\']+)["\']',
+                r'_token["\s:=]+["\']([^"\']+)["\']',
+                r'<meta[^>]+name=["\']csrf-token["\'][^>]+content=["\']([^"\']+)["\']',
+            ]:
+                m = re.search(pattern, html, re.I)
+                if m:
+                    csrf_token = m.group(1)
+                    break
+        except Exception:
+            pass
+
+        # Step 2 — call the API with session cookies
+        post_headers = {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json",
+            "Origin": base_url,
+            "Referer": page_url,
+            "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124"',
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
+        }
+
+        if csrf_token:
+            post_headers["X-CSRF-TOKEN"] = csrf_token
+            post_headers["X-Csrf-Token"]  = csrf_token
+
+        payload = {"url": sora_url}
+
+        try:
+            api_resp = await client.post(api_url, json=payload, headers=post_headers)
+            if api_resp.status_code == 200:
+                result = extract_video_from_response(api_resp.text)
+                if result:
+                    return result
+        except Exception:
+            pass
+
+        # Step 3 — try form-encoded as fallback
+        try:
+            form_headers = {**post_headers, "Content-Type": "application/x-www-form-urlencoded"}
+            api_resp2 = await client.post(api_url, data={"url": sora_url}, headers=form_headers)
+            if api_resp2.status_code == 200:
+                result = extract_video_from_response(api_resp2.text)
+                if result:
+                    return result
+        except Exception:
+            pass
+
+    return None
+
+
+async def try_page_scrape(url: str) -> Optional[str]:
+    """Fallback: scrape the Sora share page directly."""
     try:
-        resp = await client.get(url, headers=BROWSER_HEADERS, follow_redirects=True, timeout=20)
-        html = resp.text
+        async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
+            resp = await client.get(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "identity",
+            })
+            html = resp.text
     except Exception:
         return None
 
-    # Strategy 1: og:video meta tag
-    for pattern in [
+    # og:video
+    for pat in [
         r'<meta[^>]+property=["\']og:video:url["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+property=["\']og:video["\'][^>]+content=["\']([^"\']+)["\']',
         r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:video["\']',
     ]:
-        m = re.search(pattern, html, re.I)
+        m = re.search(pat, html, re.I)
         if m and ("mp4" in m.group(1) or "video" in m.group(1)):
             return m.group(1)
 
-    # Strategy 2: twitter player stream
-    m = re.search(r'<meta[^>]+name=["\']twitter:player:stream["\'][^>]+content=["\']([^"\']+)["\']', html, re.I)
-    if m:
-        return m.group(1)
+    # __NEXT_DATA__
+    nd = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.S)
+    if nd:
+        result = extract_video_from_response(nd.group(1))
+        if result:
+            return result
 
-    # Strategy 3: <video src> or <source src>
-    m = re.search(r'<(?:video|source)[^>]+src=["\']([^"\']+\.mp4[^"\']*)["\']', html, re.I)
-    if m:
-        return m.group(1)
-
-    # Strategy 4: __NEXT_DATA__ JSON deep search
-    m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', html, re.S)
-    if m:
-        try:
-            data_str = json.dumps(json.loads(m.group(1)))
-            # Look for CDN video URLs
-            for cdn_pattern in [
-                r'https://[^"\\]+oaiusercontent[^"\\]+\.mp4[^"\\]*',
-                r'https://cdn\.openai\.com[^"\\]+\.mp4[^"\\]*',
-                r'https://videos\.openai\.com[^"\\]+\.mp4[^"\\]*',
-                r'https://[^"\\]+\.cloudfront\.net[^"\\]+\.mp4[^"\\]*',
-                r'https://[^"\\]+\.mp4[^"\\]*',
-            ]:
-                cdn = re.search(cdn_pattern, data_str)
-                if cdn:
-                    return cdn.group(0).replace('\\u0026', '&')
-        except Exception:
-            pass
-
-    # Strategy 5: Any CDN .mp4 URL in raw HTML
-    for cdn_pattern in [
-        r'https://[^"\'<>\s]+oaiusercontent[^"\'<>\s]+\.mp4[^"\'<>\s]*',
-        r'https://cdn\.openai\.com[^"\'<>\s]+\.mp4[^"\'<>\s]*',
-        r'https://videos\.openai\.com[^"\'<>\s]+\.mp4[^"\'<>\s]*',
+    # Raw HTML
+    for pat in [
+        r'https://videos\.openai\.com[^"\'<>\s]+',
+        r'https://[^"\'<>\s]*oaiusercontent[^"\'<>\s]+',
         r'https://[^"\'<>\s]+\.mp4[^"\'<>\s]*',
     ]:
-        m = re.search(cdn_pattern, html, re.I)
+        m = re.search(pat, html, re.I)
         if m:
             return m.group(0)
 
     return None
 
 
-async def try_oembed(url: str, client: httpx.AsyncClient) -> Optional[str]:
-    """Try oEmbed endpoint which some platforms expose for share links."""
-    try:
-        oembed_url = f"https://sora.chatgpt.com/oembed?url={urllib.parse.quote(url)}&format=json"
-        resp = await client.get(oembed_url, headers=API_HEADERS, timeout=8)
-        if resp.status_code == 200:
-            data = resp.json()
-            data_str = json.dumps(data)
-            m = re.search(r'https://[^"\'\\]+\.mp4[^"\'\\]*', data_str)
-            if m:
-                return m.group(0)
-    except Exception:
-        pass
-    return None
-
-
-async def resolve_to_video_url(url: str, client: httpx.AsyncClient) -> str:
-    """
-    Master resolver: try all strategies in order, return first working video URL.
-    """
+async def resolve_to_video_url(url: str) -> str:
     url = url.strip()
 
-    # Already a direct .mp4? Just return it.
+    # Already a direct video
     if is_direct_video(url):
-        try:
-            resp = await client.head(url, headers=VIDEO_HEADERS, follow_redirects=True, timeout=10)
+        async with httpx.AsyncClient(follow_redirects=True, timeout=10) as client:
+            resp = await client.head(url, headers=VIDEO_HEADERS)
             return str(resp.url)
-        except Exception:
-            return url
+
+    # 1. Fliflik (with session)
+    result = await try_fliflik(url)
+    if result:
+        return result
+
+    # 2. Page scrape
+    result = await try_page_scrape(url)
+    if result:
+        return result
 
     share_id = extract_share_id(url)
-
-    # 1. Try Sora's internal API (fastest, most reliable)
-    if share_id:
-        api_url = await try_sora_api(share_id, client)
-        if api_url:
-            return api_url
-
-    # 2. Try oEmbed
-    oembed_url = await try_oembed(url, client)
-    if oembed_url:
-        return oembed_url
-
-    # 3. Try page scraping
-    page_url = await try_page_scrape(url, client)
-    if page_url:
-        return page_url
-
-    # 4. All failed
     raise HTTPException(
         status_code=422,
         detail={
             "error": "video_not_found",
-            "message": "Is share link se video URL nahi mili. Video private ho sakti hai ya Sora ne API update kar di ho. Dev Tools Network tab se .mp4 URL directly copy karein.",
+            "message": "Video URL extract nahi ho saki.",
             "share_id": share_id,
-            "tried": ["sora_api", "oembed", "page_scrape"],
         }
     )
 
 
-# ─── Routes ────────────────────────────────────────────────────────────
+# ─── Routes ──────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
-    return {"message": "SoraFetch API v3 running", "version": "3.0.0"}
+    return {"message": "SoraFetch API v5 running", "version": "5.0.0"}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "5.0.0"}
 
 
 @app.get("/extract")
-async def extract_url(url: str = Query(..., description="Sora share URL")):
-    """Extract direct video URL from a Sora share link."""
+async def extract_url(url: str = Query(...)):
     try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            video_url = await resolve_to_video_url(url, client)
-            share_id = extract_share_id(url)
-            return {
-                "status": "found",
-                "original_url": url,
-                "video_url": video_url,
-                "filename": guess_filename(video_url, share_id),
-            }
+        video_url = await resolve_to_video_url(url)
+        return {
+            "status": "found",
+            "original_url": url,
+            "video_url": video_url,
+            "filename": guess_filename(video_url, extract_share_id(url)),
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -310,25 +313,23 @@ async def extract_url(url: str = Query(..., description="Sora share URL")):
 
 @app.get("/info")
 async def get_video_info(url: str = Query(...)):
-    """Get metadata without downloading."""
     try:
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-            video_url = await resolve_to_video_url(url, client)
-            share_id = extract_share_id(url)
-            try:
-                resp = await client.head(video_url, headers=VIDEO_HEADERS, timeout=10)
+        video_url = await resolve_to_video_url(url)
+        try:
+            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+                resp = await client.head(video_url, headers=VIDEO_HEADERS)
                 cl = resp.headers.get("content-length")
                 size = int(cl) if cl else None
-            except Exception:
-                size = None
-            return {
-                "original_url": url,
-                "video_url": video_url,
-                "filename": guess_filename(video_url, share_id),
-                "size": size,
-                "size_human": format_bytes(size) if size else None,
-                "status": "ready",
-            }
+        except Exception:
+            size = None
+        return {
+            "original_url": url,
+            "video_url": video_url,
+            "filename": guess_filename(video_url, extract_share_id(url)),
+            "size": size,
+            "size_human": format_bytes(size) if size else None,
+            "status": "ready",
+        }
     except HTTPException:
         raise
     except Exception as e:
@@ -337,11 +338,9 @@ async def get_video_info(url: str = Query(...)):
 
 @app.get("/download")
 async def download_video(url: str = Query(...), filename: Optional[str] = Query(None)):
-    """Resolve and stream video to browser."""
     try:
         url = url.strip()
-        async with httpx.AsyncClient(timeout=25, follow_redirects=True) as client:
-            video_url = await resolve_to_video_url(url, client)
+        video_url = await resolve_to_video_url(url)
 
         share_id = extract_share_id(url)
         out_filename = filename or guess_filename(video_url, share_id)
@@ -354,7 +353,6 @@ async def download_video(url: str = Query(...), filename: Optional[str] = Query(
             "Access-Control-Allow-Origin": "*",
         }
 
-        # Get content-length for progress bar
         try:
             async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
                 head = await client.head(video_url, headers=VIDEO_HEADERS)
@@ -387,16 +385,14 @@ async def batch_info(request: BatchRequest):
     if len(request.urls) > 50:
         raise HTTPException(status_code=400, detail="Max 50 URLs allowed.")
     results = []
-    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-        for url in request.urls:
-            try:
-                video_url = await resolve_to_video_url(url, client)
-                share_id = extract_share_id(url)
-                results.append({
-                    "url": url, "video_url": video_url,
-                    "filename": guess_filename(video_url, share_id),
-                    "status": "ready",
-                })
-            except Exception as e:
-                results.append({"url": url, "status": "error", "error": str(e)})
+    for url in request.urls:
+        try:
+            video_url = await resolve_to_video_url(url)
+            results.append({
+                "url": url, "video_url": video_url,
+                "filename": guess_filename(video_url, extract_share_id(url)),
+                "status": "ready",
+            })
+        except Exception as e:
+            results.append({"url": url, "status": "error", "error": str(e)})
     return JSONResponse(content={"results": results})
