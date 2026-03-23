@@ -116,26 +116,54 @@ def safe_filename(name: str, ext: str = "mp4") -> str:
 
 def get_best_format(platform: str, quality: str = "best") -> str:
     ffmpeg = is_ffmpeg_available()
-    quality_map = {
-        "4k":   "bestvideo[height<=2160]+bestaudio/best[height<=2160]",
-        "hd":   "bestvideo[height<=1080]+bestaudio/best[height<=1080]",
-        "sd":   "bestvideo[height<=480]+bestaudio/best[height<=480]",
-        "best": "bestvideo+bestaudio/best",
-    }
+
     if not ffmpeg:
         return "best[ext=mp4]/best[ext=webm]/best"
-    fmt = quality_map.get(quality, quality_map["best"])
+
     if platform in ("tiktok", "douyin"):
-        return "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+
     if platform == "youtube":
+        # Long fallback chain — yt-dlp tries each slash-separated option in order
         q_yt = {
-            "4k":   "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best",
-            "hd":   "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best",
-            "sd":   "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best",
-            "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+            "4k": (
+                "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo[height<=2160]+bestaudio"
+                "/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo[height<=1080]+bestaudio"
+                "/best[height<=2160]/best"
+            ),
+            "hd": (
+                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo[height<=1080]+bestaudio"
+                "/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo[height<=720]+bestaudio"
+                "/best[height<=1080]/best"
+            ),
+            "sd": (
+                "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo[height<=480]+bestaudio"
+                "/bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo[height<=360]+bestaudio"
+                "/best[height<=480]/best"
+            ),
+            "best": (
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
+                "/bestvideo+bestaudio"
+                "/bestvideo[ext=mp4]+bestaudio"
+                "/best[ext=mp4]/best"
+            ),
         }
         return q_yt.get(quality, q_yt["best"])
-    return fmt
+
+    # All other platforms
+    quality_map = {
+        "4k":   "bestvideo[height<=2160]+bestaudio/best",
+        "hd":   "bestvideo[height<=1080]+bestaudio/best",
+        "sd":   "bestvideo[height<=480]+bestaudio/best",
+        "best": "bestvideo+bestaudio/best",
+    }
+    return quality_map.get(quality, quality_map["best"])
 
 
 def build_ydl_opts(platform: str, out_path: str, quality: str = "best",
@@ -271,16 +299,6 @@ async def run_ydl(url: str, opts: dict) -> dict:
 
     loop = asyncio.get_event_loop()
 
-    # YouTube bot-detection fallback chain
-    # Try multiple player clients until one works
-    yt_fallback_clients = [
-        ["android"],
-        ["tv_embedded"],
-        ["android", "tv_embedded"],
-        ["mweb"],
-        ["ios"],
-    ]
-
     is_youtube = "youtube.com" in url or "youtu.be" in url
 
     try:
@@ -296,12 +314,35 @@ async def run_ydl(url: str, opts: dict) -> dict:
             except Exception as e2:
                 raise HTTPException(status_code=422, detail={"error": "ffmpeg_error", "message": str(e2)[:300]})
 
-        # YouTube bot / sign-in error — try each client
-        if is_youtube and ("sign in" in err.lower() or "bot" in err.lower() or "confirm" in err.lower()):
-            for clients in yt_fallback_clients:
+        # YouTube errors — bot detection OR format not available
+        # Both are fixed by trying different player clients + simpler formats
+        yt_errors = (
+            "sign in" in err.lower() or
+            "bot" in err.lower() or
+            "confirm" in err.lower() or
+            "not available" in err.lower() or
+            "requested format" in err.lower() or
+            "format" in err.lower()
+        )
+
+        if is_youtube and yt_errors:
+            # Try each client with progressively simpler formats
+            fallback_combos = [
+                # (clients, format)
+                (["android"],               "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"),
+                (["tv_embedded"],           "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"),
+                (["ios"],                   "bestvideo+bestaudio/best"),
+                (["android", "tv_embedded"],"bestvideo+bestaudio/best"),
+                (["mweb"],                  "best[ext=mp4]/best"),
+                (["android"],               "best"),
+                (["tv_embedded"],           "best"),
+            ]
+
+            for clients, fmt in fallback_combos:
                 try:
                     yt_opts = {
                         **opts,
+                        "format": fmt,
                         "extractor_args": {
                             "youtube": {
                                 "player_client": clients,
@@ -318,10 +359,9 @@ async def run_ydl(url: str, opts: dict) -> dict:
                 except Exception:
                     continue
 
-            # All clients failed — give clear user message
             raise HTTPException(status_code=422, detail={
-                "error": "youtube_bot_detected",
-                "message": "YouTube is server IP ko block kar raha hai. Koi doosra YouTube link try karein, ya seedha YouTube se download karein.",
+                "error": "youtube_failed",
+                "message": "YouTube video download nahi ho saki. Video age-restricted, private, ya region-locked ho sakti hai.",
                 "platform": "youtube",
             })
 
