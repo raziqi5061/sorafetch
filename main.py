@@ -810,6 +810,224 @@ async def get_clip_file(path: str = Query(...)):
     })
 
 
+# ── Enhance endpoint (Sora quality boost via ffmpeg) ─────────────────
+
+ENHANCE_PRESETS = {
+    "light": {
+        "label": "Light Boost",
+        "desc": "Subtle sharpening + contrast — fast",
+        "vf": "unsharp=5:5:0.8:3:3:0.4,eq=contrast=1.05:brightness=0.01:saturation=1.1",
+        "crf": "20",
+        "preset": "fast",
+    },
+    "standard": {
+        "label": "Standard Enhance",
+        "desc": "Denoise + sharpen + upscale to 1080p",
+        "vf": (
+            "hqdn3d=2:1.5:6:4.5,"
+            "unsharp=5:5:1.2:3:3:0.6,"
+            "scale=1920:1080:flags=lanczos,"
+            "eq=contrast=1.08:brightness=0.02:saturation=1.15:gamma=0.95"
+        ),
+        "crf": "18",
+        "preset": "medium",
+    },
+    "strong": {
+        "label": "Strong Enhance",
+        "desc": "Heavy denoise + sharpen + 4x upscale + color grade",
+        "vf": (
+            "hqdn3d=3:2.5:8:6,"
+            "unsharp=7:7:1.5:5:5:0.8,"
+            "scale=iw*2:ih*2:flags=lanczos,"
+            "eq=contrast=1.12:brightness=0.02:saturation=1.2:gamma=0.92,"
+            "unsharp=3:3:0.5:3:3:0.3"
+        ),
+        "crf": "16",
+        "preset": "slow",
+    },
+    "cinematic": {
+        "label": "Cinematic",
+        "desc": "Film-grade color + denoise + sharpness",
+        "vf": (
+            "hqdn3d=2:1.5:5:4,"
+            "unsharp=5:5:1.0:3:3:0.5,"
+            "scale=1920:1080:flags=lanczos,"
+            "eq=contrast=1.1:brightness=0.0:saturation=0.95:gamma=0.9,"
+            "curves=preset=lighter,"
+            "vignette=PI/5"
+        ),
+        "crf": "17",
+        "preset": "medium",
+    },
+}
+
+
+@app.get("/enhance/presets")
+async def get_enhance_presets():
+    """Return available enhancement presets."""
+    return {
+        "presets": [
+            {"id": k, "label": v["label"], "desc": v["desc"]}
+            for k, v in ENHANCE_PRESETS.items()
+        ],
+        "ffmpeg_available": is_ffmpeg_available(),
+    }
+
+
+@app.get("/enhance")
+async def enhance_video(
+    url: str = Query(..., description="Sora share URL"),
+    preset: str = Query("standard", description="light | standard | strong | cinematic"),
+    filename: Optional[str] = Query(None),
+):
+    """
+    Download Sora video and enhance quality using ffmpeg filters.
+    Applies: denoise, sharpening, upscaling, color grading.
+    """
+    if not is_ffmpeg_available():
+        raise HTTPException(status_code=503, detail={
+            "error": "ffmpeg_not_available",
+            "message": "ffmpeg zaroori hai enhancement ke liye. nixpacks.toml check karein.",
+        })
+
+    if preset not in ENHANCE_PRESETS:
+        raise HTTPException(status_code=400, detail=f"Invalid preset. Use: {', '.join(ENHANCE_PRESETS)}")
+
+    url = url.strip()
+    config = ENHANCE_PRESETS[preset]
+    tmp_dir = tempfile.mkdtemp()
+
+    try:
+        # Step 1: Download original Sora video
+        video_url = await resolve_sora(url)
+        src_path = os.path.join(tmp_dir, "original.mp4")
+
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(connect=20.0, read=600.0, write=60.0, pool=10.0),
+            follow_redirects=True,
+        ) as client:
+            async with client.stream("GET", video_url, headers=VIDEO_HEADERS) as resp:
+                resp.raise_for_status()
+                with open(src_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
+                        f.write(chunk)
+
+        if not Path(src_path).exists() or Path(src_path).stat().st_size == 0:
+            raise HTTPException(status_code=500, detail="Original video download failed.")
+
+        # Step 2: Get original video info
+        probe_cmd = [
+            "ffprobe", "-v", "quiet", "-print_format", "json",
+            "-show_streams", "-select_streams", "v:0", src_path,
+        ]
+        probe_proc = await asyncio.create_subprocess_exec(
+            *probe_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        probe_stdout, _ = await probe_proc.communicate()
+        orig_w, orig_h = 0, 0
+        try:
+            probe_data = json.loads(probe_stdout)
+            stream = probe_data.get("streams", [{}])[0]
+            orig_w = int(stream.get("width", 0))
+            orig_h = int(stream.get("height", 0))
+        except Exception:
+            pass
+
+        # Step 3: Build smart vf — don't upscale if already HD
+        vf = config["vf"]
+        if preset == "standard" and orig_h >= 1080:
+            # Already 1080p+ — skip upscale, just denoise+sharpen+color
+            vf = (
+                "hqdn3d=2:1.5:6:4.5,"
+                "unsharp=5:5:1.2:3:3:0.6,"
+                "eq=contrast=1.08:brightness=0.02:saturation=1.15:gamma=0.95"
+            )
+        elif preset == "strong" and orig_h >= 720:
+            # Already decent res — upscale 1.5x instead of 2x
+            vf = (
+                "hqdn3d=3:2.5:8:6,"
+                "unsharp=7:7:1.5:5:5:0.8,"
+                f"scale={max(orig_w, 1920)}:{max(orig_h, 1080)}:flags=lanczos,"
+                "eq=contrast=1.12:brightness=0.02:saturation=1.2:gamma=0.92"
+            )
+
+        # Step 4: Apply ffmpeg enhancement
+        enhanced_path = os.path.join(tmp_dir, "enhanced.mp4")
+        ffmpeg_cmd = [
+            "ffmpeg", "-y",
+            "-i", src_path,
+            "-vf", vf,
+            "-c:v", "libx264",
+            "-crf", config["crf"],
+            "-preset", config["preset"],
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-movflags", "+faststart",
+            "-pix_fmt", "yuv420p",
+            enhanced_path,
+        ]
+
+        proc = await asyncio.create_subprocess_exec(
+            *ffmpeg_cmd,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            err_text = stderr.decode(errors="ignore")[-600:] if stderr else "ffmpeg error"
+            raise HTTPException(status_code=500, detail={
+                "error": "enhance_failed",
+                "message": err_text,
+            })
+
+        enhanced_file = Path(enhanced_path)
+        if not enhanced_file.exists() or enhanced_file.stat().st_size == 0:
+            raise HTTPException(status_code=500, detail="Enhanced file not created.")
+
+        # Build output filename
+        sid = re.search(r'/p/(s_[a-f0-9]+)', url, re.I)
+        base_name = sid.group(1) if sid else "sora_video"
+        date_str = datetime.now().strftime("%Y%m%d")
+        out_filename = filename or f"SORA_{date_str}_{base_name}_{preset}_enhanced.mp4"
+        out_filename = re.sub(r'[^\w\-.]', '_', out_filename)[:120]
+
+        file_size = enhanced_file.stat().st_size
+        orig_size = Path(src_path).stat().st_size
+
+        async def enhanced_stream():
+            try:
+                with open(enhanced_file, "rb") as f:
+                    while True:
+                        chunk = f.read(CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
+        return StreamingResponse(
+            enhanced_stream(),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="{out_filename}"',
+                "Content-Length": str(file_size),
+                "Access-Control-Allow-Origin": "*",
+                "X-Original-Size": str(orig_size),
+                "X-Enhanced-Size": str(file_size),
+                "X-Preset": preset,
+                "X-Original-Resolution": f"{orig_w}x{orig_h}" if orig_w else "unknown",
+            },
+        )
+
+    except HTTPException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=str(e)[:300])
+
+
 # ── Thumbnail endpoint ────────────────────────────────────────────────
 @app.get("/thumbnail")
 async def get_thumbnail(url: str = Query(...)):
