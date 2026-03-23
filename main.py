@@ -1,7 +1,7 @@
 """
-MultiVidFetch - FastAPI Backend v6
-Multi-platform video downloader:
-  Sora, TikTok, Facebook, Instagram, Twitter/X, Douyin, Bilibili
+MultiVidFetch - FastAPI Backend v7
+Multi-platform: Sora, TikTok, Facebook, Instagram, Twitter/X, Douyin, Bilibili
+ffmpeg-safe format selection + nixpacks ffmpeg support
 """
 
 import asyncio
@@ -15,12 +15,12 @@ from typing import Optional
 
 import httpx
 import yt_dlp
-from fastapi import FastAPI, HTTPException, Query, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="MultiVidFetch API", version="6.0.0")
+app = FastAPI(title="MultiVidFetch API", version="7.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,28 +30,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-CHUNK_SIZE = 1024 * 512  # 512 KB
+CHUNK_SIZE = 1024 * 512
 
-# ─── Platform Detection ───────────────────────────────────────────────
+# ─── Platform detection ───────────────────────────────────────────────
 
 PLATFORM_PATTERNS = {
-    "sora":      [r"sora\.chatgpt\.com", r"sora\.openai\.com", r"sora\.com/p/"],
+    "sora":      [r"sora\.chatgpt\.com", r"sora\.openai\.com"],
     "tiktok":    [r"tiktok\.com", r"vm\.tiktok\.com", r"vt\.tiktok\.com"],
     "douyin":    [r"douyin\.com", r"iesdouyin\.com"],
     "facebook":  [r"facebook\.com", r"fb\.com", r"fb\.watch"],
     "instagram": [r"instagram\.com", r"instagr\.am"],
-    "twitter":   [r"twitter\.com", r"x\.com", r"t\.co"],
+    "twitter":   [r"twitter\.com", r"x\.com"],
     "bilibili":  [r"bilibili\.com", r"b23\.tv"],
 }
 
 PLATFORM_NAMES = {
-    "sora": "Sora",
-    "tiktok": "TikTok",
-    "douyin": "Douyin",
-    "facebook": "Facebook",
-    "instagram": "Instagram",
-    "twitter": "Twitter/X",
-    "bilibili": "Bilibili",
+    "sora": "Sora", "tiktok": "TikTok", "douyin": "Douyin",
+    "facebook": "Facebook", "instagram": "Instagram",
+    "twitter": "Twitter/X", "bilibili": "Bilibili",
 }
 
 
@@ -72,7 +68,7 @@ def format_bytes(size: int) -> str:
 
 
 def safe_filename(name: str, ext: str = "mp4") -> str:
-    name = re.sub(r'[^\w\-.]', '_', name)
+    name = re.sub(r'[^\w\-.]', '_', str(name))
     name = re.sub(r'_+', '_', name).strip('_')
     if not name:
         name = "video"
@@ -81,7 +77,98 @@ def safe_filename(name: str, ext: str = "mp4") -> str:
     return name[:100]
 
 
-# ─── Sora Extractor (fliflik method) ─────────────────────────────────
+def is_ffmpeg_available() -> bool:
+    """Check if ffmpeg is installed on the system."""
+    import shutil
+    return shutil.which("ffmpeg") is not None
+
+
+def get_best_format(platform: str) -> str:
+    """
+    Return yt-dlp format string.
+    If ffmpeg available: prefer best quality with merge.
+    If not: prefer pre-merged single-file formats only.
+    """
+    if is_ffmpeg_available():
+        # Full quality with merge
+        if platform == "tiktok":
+            return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        if platform == "bilibili":
+            return "bestvideo+bestaudio/best"
+        return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    else:
+        # No ffmpeg — only pre-merged formats, no merging needed
+        return "best[ext=mp4]/best[ext=webm]/best"
+
+
+# ─── yt-dlp common options ────────────────────────────────────────────
+
+def build_ydl_opts(platform: str, out_path: str) -> dict:
+    fmt = get_best_format(platform)
+
+    base = {
+        "format": fmt,
+        "outtmpl": out_path,
+        "quiet": True,
+        "no_warnings": True,
+        "merge_output_format": "mp4",
+        "socket_timeout": 30,
+        "retries": 3,
+        "noplaylist": True,
+    }
+
+    # Only add ffmpeg options if available
+    if not is_ffmpeg_available():
+        base["prefer_ffmpeg"] = False
+        base["merge_output_format"] = None
+
+    platform_extras = {
+        "tiktok": {
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+                "Referer": "https://www.tiktok.com/",
+            },
+            "extractor_args": {
+                "tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"}
+            },
+        },
+        "douyin": {
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+                "Referer": "https://www.douyin.com/",
+            },
+        },
+        "facebook": {
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+        },
+        "instagram": {
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            },
+        },
+        "twitter": {
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            },
+        },
+        "bilibili": {
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://www.bilibili.com/",
+            },
+        },
+    }
+
+    if platform in platform_extras:
+        base.update(platform_extras[platform])
+
+    return base
+
+
+# ─── Sora extractor (fliflik) ─────────────────────────────────────────
 
 FLIFLIK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -117,7 +204,6 @@ def find_video_url_in_text(text: str) -> Optional[str]:
     for pat in [
         r'https://videos\.openai\.com[^"\'<>\s\\]+',
         r'https://[^"\'<>\s\\]*oaiusercontent[^"\'<>\s\\]+',
-        r'https://cdn\.openai\.com[^"\'<>\s\\]+\.mp4[^"\'<>\s\\]*',
         r'https://[^"\'<>\s\\]+\.mp4[^"\'<>\s\\]*',
     ]:
         m = re.search(pat, text)
@@ -127,16 +213,14 @@ def find_video_url_in_text(text: str) -> Optional[str]:
 
 
 async def resolve_sora(url: str) -> str:
-    async with httpx.AsyncClient(follow_redirects=True, timeout=30,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}) as client:
-
-        # Visit fliflik page for cookies
+    async with httpx.AsyncClient(
+        follow_redirects=True, timeout=30,
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    ) as client:
         try:
             await client.get("https://online.fliflik.com/sora-video-downloader/", timeout=10)
         except Exception:
             pass
-
-        # POST to fliflik API
         try:
             resp = await client.post(
                 "https://online.fliflik.com/get-video-link",
@@ -153,197 +237,93 @@ async def resolve_sora(url: str) -> str:
 
     raise HTTPException(status_code=422, detail={
         "error": "sora_extract_failed",
-        "message": "Sora video URL extract nahi ho saki. Video private ho sakti hai.",
+        "message": "Sora video URL extract nahi ho saki.",
         "platform": "sora",
     })
 
 
-# ─── yt-dlp Extractor (TikTok, FB, IG, Twitter, Douyin, Bilibili) ────
+# ─── yt-dlp download ──────────────────────────────────────────────────
 
-YDL_COMMON_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "extract_flat": False,
-    "socket_timeout": 30,
-}
+async def download_with_ytdlp(url: str, platform: str, out_path: str) -> dict:
+    opts = build_ydl_opts(platform, out_path)
 
-PLATFORM_YDL_OPTS = {
-    "tiktok": {
-        **YDL_COMMON_OPTS,
-        "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-            "Referer": "https://www.tiktok.com/",
-        },
-        # Remove TikTok watermark by preferring no-watermark sources
-        "extractor_args": {"tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"}},
-    },
-    "douyin": {
-        **YDL_COMMON_OPTS,
-        "format": "bestvideo[ext=mp4]+bestaudio/best",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-            "Referer": "https://www.douyin.com/",
-        },
-    },
-    "facebook": {
-        **YDL_COMMON_OPTS,
-        "format": "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        },
-    },
-    "instagram": {
-        **YDL_COMMON_OPTS,
-        "format": "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        },
-    },
-    "twitter": {
-        **YDL_COMMON_OPTS,
-        "format": "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-    },
-    "bilibili": {
-        **YDL_COMMON_OPTS,
-        "format": "bestvideo[ext=mp4]+bestaudio/best",
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Referer": "https://www.bilibili.com/",
-        },
-    },
-    "generic": {
-        **YDL_COMMON_OPTS,
-        "format": "bestvideo[ext=mp4]+bestaudio/best[ext=mp4]/best",
-    },
-}
-
-
-def get_ydl_opts(platform: str) -> dict:
-    return PLATFORM_YDL_OPTS.get(platform, PLATFORM_YDL_OPTS["generic"])
-
-
-async def extract_info_ytdlp(url: str, platform: str) -> dict:
-    """Extract video info using yt-dlp (no download)."""
-    opts = {**get_ydl_opts(platform), "skip_download": True}
-
-    def _extract():
+    def _run():
         with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
+            return ydl.extract_info(url, download=True)
 
     loop = asyncio.get_event_loop()
     try:
-        info = await loop.run_in_executor(None, _extract)
-        return info
+        return await loop.run_in_executor(None, _run)
     except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=422, detail={
-            "error": "extract_failed",
-            "message": str(e)[:200],
-            "platform": platform,
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)[:200])
+        err_msg = str(e)
 
+        # ffmpeg missing error — retry with no-merge format
+        if "ffmpeg" in err_msg.lower() or "merger" in err_msg.lower():
+            fallback_opts = {**opts, "format": "best[ext=mp4]/best[ext=webm]/best"}
+            if "merge_output_format" in fallback_opts:
+                fallback_opts["merge_output_format"] = None
 
-async def download_ytdlp_to_file(url: str, platform: str, out_path: str) -> dict:
-    """Download video using yt-dlp to a temp file, return info."""
-    opts = {
-        **get_ydl_opts(platform),
-        "outtmpl": out_path,
-        "merge_output_format": "mp4",
-    }
+            def _retry():
+                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                    return ydl.extract_info(url, download=True)
 
-    def _download():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            return info
+            try:
+                return await loop.run_in_executor(None, _retry)
+            except Exception as e2:
+                raise HTTPException(status_code=422, detail={
+                    "error": "download_failed",
+                    "message": str(e2)[:300],
+                    "platform": platform,
+                })
 
-    loop = asyncio.get_event_loop()
-    try:
-        info = await loop.run_in_executor(None, _download)
-        return info
-    except yt_dlp.utils.DownloadError as e:
         raise HTTPException(status_code=422, detail={
             "error": "download_failed",
-            "message": str(e)[:300],
+            "message": err_msg[:300],
             "platform": platform,
         })
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)[:200])
+
+
+def find_downloaded_file(tmp_dir: str) -> Optional[Path]:
+    """Find the actual downloaded file — yt-dlp writes real ext."""
+    candidates = sorted(
+        [f for f in Path(tmp_dir).iterdir() if f.is_file()],
+        key=lambda f: f.stat().st_size,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
 
 
 # ─── Routes ──────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
+    ffmpeg = is_ffmpeg_available()
     return {
-        "message": "MultiVidFetch API v6 running",
-        "version": "6.0.0",
-        "supported_platforms": list(PLATFORM_NAMES.values()),
+        "message": "MultiVidFetch API v7",
+        "version": "7.0.0",
+        "ffmpeg_available": ffmpeg,
+        "supported": list(PLATFORM_NAMES.values()),
     }
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "6.0.0"}
+    return {
+        "status": "ok",
+        "version": "7.0.0",
+        "ffmpeg": is_ffmpeg_available(),
+    }
 
 
 @app.get("/detect")
 async def detect(url: str = Query(...)):
-    """Detect platform from URL."""
     platform = detect_platform(url)
-    return {
-        "url": url,
-        "platform": platform,
-        "platform_name": PLATFORM_NAMES.get(platform, "Generic"),
-    }
-
-
-@app.get("/info")
-async def get_info(url: str = Query(...)):
-    """Get video metadata without downloading."""
-    url = url.strip()
-    platform = detect_platform(url)
-
-    if platform == "sora":
-        video_url = await resolve_sora(url)
-        try:
-            async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
-                resp = await client.head(video_url, headers=VIDEO_HEADERS)
-                cl = resp.headers.get("content-length")
-                size = int(cl) if cl else None
-        except Exception:
-            size = None
-        share_id = extract_share_id(url)
-        return {
-            "platform": "sora",
-            "platform_name": "Sora",
-            "title": f"Sora Video {share_id or ''}",
-            "url": url,
-            "video_url": video_url,
-            "size": size,
-            "size_human": format_bytes(size) if size else None,
-            "filename": f"sora-{share_id or 'video'}.mp4",
-        }
-
-    # yt-dlp platforms
-    info = await extract_info_ytdlp(url, platform)
-    title = info.get("title", "video")
-    duration = info.get("duration")
-    uploader = info.get("uploader") or info.get("channel") or ""
-    filesize = info.get("filesize") or info.get("filesize_approx")
-
     return {
         "platform": platform,
         "platform_name": PLATFORM_NAMES.get(platform, "Generic"),
-        "title": title,
-        "uploader": uploader,
-        "duration": duration,
-        "url": url,
-        "size": filesize,
-        "size_human": format_bytes(filesize) if filesize else None,
-        "filename": safe_filename(title),
-        "thumbnail": info.get("thumbnail"),
+        "ffmpeg_available": is_ffmpeg_available(),
     }
 
 
@@ -351,13 +331,11 @@ async def get_info(url: str = Query(...)):
 async def download_video(
     url: str = Query(...),
     filename: Optional[str] = Query(None),
-    quality: str = Query("best", description="best | hd | sd"),
 ):
-    """Download and stream video to browser."""
     url = url.strip()
     platform = detect_platform(url)
 
-    # ── Sora: stream directly from CDN ───────────────────────────────
+    # ── Sora ─────────────────────────────────────────────────────────
     if platform == "sora":
         video_url = await resolve_sora(url)
         share_id = extract_share_id(url)
@@ -389,36 +367,28 @@ async def download_video(
 
         return StreamingResponse(sora_stream(), media_type="video/mp4", headers=resp_headers)
 
-    # ── yt-dlp platforms: download to temp, stream to client ─────────
+    # ── yt-dlp platforms ──────────────────────────────────────────────
     tmp_dir = tempfile.mkdtemp()
     tmp_path = os.path.join(tmp_dir, "video.%(ext)s")
 
     try:
-        info = await download_ytdlp_to_file(url, platform, tmp_path)
+        info = await download_with_ytdlp(url, platform, tmp_path)
 
-        # Find the downloaded file
-        title = info.get("title", "video")
-        ext = info.get("ext", "mp4")
+        actual_file = find_downloaded_file(tmp_dir)
+        if not actual_file:
+            raise HTTPException(status_code=500, detail="Downloaded file not found.")
+
+        title = info.get("title", "video") if info else "video"
+        ext = actual_file.suffix.lstrip('.') or "mp4"
         out_filename = filename or safe_filename(title, ext)
-
-        # yt-dlp writes actual ext into filename
-        actual_file = None
-        for f in Path(tmp_dir).iterdir():
-            if f.is_file():
-                actual_file = f
-                break
-
-        if not actual_file or not actual_file.exists():
-            raise HTTPException(status_code=500, detail="Downloaded file not found on server.")
-
         file_size = actual_file.stat().st_size
+
         resp_headers = {
             "Content-Disposition": f'attachment; filename="{out_filename}"',
             "Content-Length": str(file_size),
             "Access-Control-Allow-Origin": "*",
         }
 
-        # Stream file to client then delete
         async def file_stream():
             try:
                 with open(actual_file, "rb") as f:
@@ -429,12 +399,13 @@ async def download_video(
                         yield chunk
             finally:
                 try:
-                    actual_file.unlink()
+                    actual_file.unlink(missing_ok=True)
                     Path(tmp_dir).rmdir()
                 except Exception:
                     pass
 
-        return StreamingResponse(file_stream(), media_type="video/mp4", headers=resp_headers)
+        media_type = "video/mp4" if ext == "mp4" else "video/webm"
+        return StreamingResponse(file_stream(), media_type=media_type, headers=resp_headers)
 
     except HTTPException:
         raise
@@ -448,21 +419,15 @@ class BatchRequest(BaseModel):
 
 @app.post("/batch/info")
 async def batch_info(request: BatchRequest):
-    """Get info for multiple URLs."""
     if len(request.urls) > 50:
         raise HTTPException(status_code=400, detail="Max 50 URLs allowed.")
-
     results = []
     for url in request.urls:
-        try:
-            platform = detect_platform(url.strip())
-            results.append({
-                "url": url,
-                "platform": platform,
-                "platform_name": PLATFORM_NAMES.get(platform, "Generic"),
-                "status": "queued",
-            })
-        except Exception as e:
-            results.append({"url": url, "status": "error", "error": str(e)})
-
+        platform = detect_platform(url.strip())
+        results.append({
+            "url": url,
+            "platform": platform,
+            "platform_name": PLATFORM_NAMES.get(platform, "Generic"),
+            "status": "queued",
+        })
     return JSONResponse(content={"results": results, "total": len(results)})
