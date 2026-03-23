@@ -126,7 +126,15 @@ def get_best_format(platform: str, quality: str = "best") -> str:
         return "best[ext=mp4]/best[ext=webm]/best"
     fmt = quality_map.get(quality, quality_map["best"])
     if platform in ("tiktok", "douyin"):
-        return f"bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+        return "bestvideo[ext=mp4][height<=1080]+bestaudio[ext=m4a]/best[ext=mp4]/best"
+    if platform == "youtube":
+        q_yt = {
+            "4k":   "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best",
+            "hd":   "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best",
+            "sd":   "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best",
+            "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        }
+        return q_yt.get(quality, q_yt["best"])
     return fmt
 
 
@@ -163,7 +171,16 @@ def build_ydl_opts(platform: str, out_path: str, quality: str = "best",
             "extractor_args": {"tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"}},
         },
         "youtube": {
-            "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            # Use Android + TV client to bypass YouTube bot detection on server IPs
+            "extractor_args": {
+                "youtube": {
+                    "player_client": ["android", "tv_embedded", "web"],
+                    "player_skip": ["webpage", "configs"],
+                }
+            },
+            "http_headers": {
+                "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
+            },
         },
         "facebook": {
             "http_headers": {
@@ -248,20 +265,66 @@ async def resolve_sora(url: str) -> str:
 # ─── yt-dlp helpers ───────────────────────────────────────────────────
 
 async def run_ydl(url: str, opts: dict) -> dict:
-    def _run():
-        with yt_dlp.YoutubeDL(opts) as ydl:
+    def _run(o):
+        with yt_dlp.YoutubeDL(o) as ydl:
             return ydl.extract_info(url, download=True)
+
     loop = asyncio.get_event_loop()
+
+    # YouTube bot-detection fallback chain
+    # Try multiple player clients until one works
+    yt_fallback_clients = [
+        ["android"],
+        ["tv_embedded"],
+        ["android", "tv_embedded"],
+        ["mweb"],
+        ["ios"],
+    ]
+
+    is_youtube = "youtube.com" in url or "youtu.be" in url
+
     try:
-        return await loop.run_in_executor(None, _run)
+        return await loop.run_in_executor(None, lambda: _run(opts))
     except yt_dlp.utils.DownloadError as e:
         err = str(e)
+
+        # ffmpeg missing — quick fix
         if "ffmpeg" in err.lower() or "merger" in err.lower():
             fallback = {**opts, "format": "best[ext=mp4]/best[ext=webm]/best", "merge_output_format": None}
             try:
-                return await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(fallback).extract_info(url, download=True))
+                return await loop.run_in_executor(None, lambda: _run(fallback))
             except Exception as e2:
-                raise HTTPException(status_code=422, detail={"error": "download_failed", "message": str(e2)[:300]})
+                raise HTTPException(status_code=422, detail={"error": "ffmpeg_error", "message": str(e2)[:300]})
+
+        # YouTube bot / sign-in error — try each client
+        if is_youtube and ("sign in" in err.lower() or "bot" in err.lower() or "confirm" in err.lower()):
+            for clients in yt_fallback_clients:
+                try:
+                    yt_opts = {
+                        **opts,
+                        "extractor_args": {
+                            "youtube": {
+                                "player_client": clients,
+                                "player_skip": ["webpage"],
+                            }
+                        },
+                        "http_headers": {
+                            "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
+                        },
+                    }
+                    return await loop.run_in_executor(None, lambda o=yt_opts: _run(o))
+                except yt_dlp.utils.DownloadError:
+                    continue
+                except Exception:
+                    continue
+
+            # All clients failed — give clear user message
+            raise HTTPException(status_code=422, detail={
+                "error": "youtube_bot_detected",
+                "message": "YouTube is server IP ko block kar raha hai. Koi doosra YouTube link try karein, ya seedha YouTube se download karein.",
+                "platform": "youtube",
+            })
+
         raise HTTPException(status_code=422, detail={"error": "download_failed", "message": err[:300]})
 
 
