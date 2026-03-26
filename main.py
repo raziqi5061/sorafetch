@@ -1171,3 +1171,142 @@ async def batch_info(request: BatchRequest):
             "status": "queued",
         })
     return JSONResponse(content={"results": results, "total": len(results)})
+
+
+# ── TikTok Profile Bulk Fetcher ───────────────────────────────────────
+
+def clean_tiktok_username(raw: str) -> str:
+    """Accept @username, username, or full profile URL — return clean username."""
+    raw = raw.strip()
+    # Full URL: tiktok.com/@username or tiktok.com/@username/video/...
+    m = re.search(r'tiktok\.com/@([^/?&\s]+)', raw, re.I)
+    if m:
+        return m.group(1)
+    # @username
+    if raw.startswith('@'):
+        return raw.lstrip('@')
+    # Plain username
+    return raw.lstrip('@')
+
+
+TIKTOK_PROFILE_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.tiktok.com/",
+}
+
+
+async def fetch_tiktok_profile_videos(username: str, max_videos: int = 50) -> List[dict]:
+    """
+    Use yt-dlp to extract all video URLs from a TikTok user profile.
+    Returns list of {url, title, duration, thumbnail, view_count}
+    """
+    profile_url = f"https://www.tiktok.com/@{username}"
+
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,        # Don't download — just list
+        "playlistend": max_videos,   # Limit videos
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+            "Referer": "https://www.tiktok.com/",
+        },
+        "extractor_args": {
+            "tiktok": {
+                "api_hostname": "api22-normal-c-useast2a.tiktokv.com",
+            }
+        },
+    }
+
+    def _extract():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(profile_url, download=False)
+            if not info:
+                return []
+            # Playlist entries
+            entries = info.get("entries") or []
+            videos = []
+            for entry in entries:
+                if not entry:
+                    continue
+                vid_url = entry.get("url") or entry.get("webpage_url") or ""
+                if not vid_url:
+                    # Build from id
+                    vid_id = entry.get("id")
+                    if vid_id:
+                        vid_url = f"https://www.tiktok.com/@{username}/video/{vid_id}"
+                videos.append({
+                    "url": vid_url,
+                    "title": entry.get("title", "")[:100],
+                    "duration": entry.get("duration"),
+                    "duration_fmt": format_duration(entry.get("duration") or 0),
+                    "thumbnail": entry.get("thumbnail"),
+                    "view_count": entry.get("view_count"),
+                    "like_count": entry.get("like_count"),
+                    "upload_date": entry.get("upload_date", ""),
+                    "id": entry.get("id", ""),
+                })
+            return videos
+
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(None, _extract)
+    except yt_dlp.utils.DownloadError as e:
+        raise HTTPException(status_code=422, detail={
+            "error": "profile_fetch_failed",
+            "message": str(e)[:300],
+            "username": username,
+        })
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)[:200])
+
+
+@app.get("/tiktok/profile")
+async def tiktok_profile_fetch(
+    username: str = Query(..., description="TikTok @username or profile URL"),
+    max_videos: int = Query(50, ge=1, le=200, description="Max videos to fetch (1-200)"),
+):
+    """
+    Fetch all video URLs from a TikTok user profile.
+    Returns list of videos ready for bulk download.
+    """
+    clean_name = clean_tiktok_username(username)
+    if not clean_name:
+        raise HTTPException(status_code=400, detail="Valid TikTok username chahiye.")
+
+    videos = await fetch_tiktok_profile_videos(clean_name, max_videos)
+
+    if not videos:
+        raise HTTPException(status_code=404, detail={
+            "error": "no_videos_found",
+            "message": f"@{clean_name} ke koi public videos nahi mile. Account private ho sakta hai.",
+            "username": clean_name,
+        })
+
+    return JSONResponse(content={
+        "username": clean_name,
+        "profile_url": f"https://www.tiktok.com/@{clean_name}",
+        "total_found": len(videos),
+        "videos": videos,
+    })
+
+
+@app.get("/tiktok/download-all")
+async def tiktok_download_all_info(
+    username: str = Query(...),
+    max_videos: int = Query(50, ge=1, le=200),
+):
+    """
+    Quick endpoint — returns all video URLs from a profile
+    ready to be passed to /download one by one.
+    """
+    clean_name = clean_tiktok_username(username)
+    videos = await fetch_tiktok_profile_videos(clean_name, max_videos)
+    urls = [v["url"] for v in videos if v.get("url")]
+    return JSONResponse(content={
+        "username": clean_name,
+        "urls": urls,
+        "total": len(urls),
+    })
