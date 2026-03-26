@@ -1310,3 +1310,149 @@ async def tiktok_download_all_info(
         "urls": urls,
         "total": len(urls),
     })
+
+
+# ── ZIP Download endpoint ─────────────────────────────────────────────
+
+class ZipRequest(BaseModel):
+    urls: List[str]
+    username: str = "videos"
+    platform: str = "tiktok"
+
+
+@app.post("/download-zip")
+async def download_zip(request: ZipRequest):
+    """
+    Download multiple videos and ZIP them into one file.
+    Max 50 videos. Works for TikTok, FB, IG, YouTube, Sora.
+    """
+    import zipfile as zf_module
+    import io as io_module
+
+    urls = [u.strip() for u in request.urls if u.strip()]
+    if not urls:
+        raise HTTPException(status_code=400, detail="Koi URL nahi di.")
+    if len(urls) > 50:
+        raise HTTPException(status_code=400, detail="Max 50 videos per ZIP.")
+
+    safe_user = re.sub(r'[^\w\-]', '_', request.username)[:30]
+    plat_label = (request.platform or "videos").upper()[:10]
+    date_str = datetime.now().strftime("%Y%m%d_%H%M")
+    zip_filename = f"{plat_label}_{safe_user}_{date_str}_{len(urls)}videos.zip"
+
+    tmp_dir = tempfile.mkdtemp()
+    vid_dir = os.path.join(tmp_dir, "videos")
+    os.makedirs(vid_dir, exist_ok=True)
+
+    base_ydl = {
+        "quiet": True,
+        "no_warnings": True,
+        "merge_output_format": "mp4" if is_ffmpeg_available() else None,
+        "socket_timeout": 30,
+        "retries": 2,
+        "noplaylist": True,
+    }
+
+    async def dl_one(url: str, idx: int) -> dict:
+        plat = detect_platform(url)
+        pfx = str(idx + 1).zfill(3)
+        out_tmpl = os.path.join(vid_dir, f"{pfx}_%(title).60s.%(ext)s")
+
+        if plat == "sora":
+            try:
+                vurl = await resolve_sora(url)
+                out_path = os.path.join(vid_dir, f"{pfx}_sora_video.mp4")
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=10.0),
+                    follow_redirects=True,
+                ) as client:
+                    async with client.stream("GET", vurl, headers=VIDEO_HEADERS) as resp:
+                        resp.raise_for_status()
+                        with open(out_path, "wb") as f:
+                            async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
+                                f.write(chunk)
+                return {"status": "ok", "file": out_path}
+            except Exception as e:
+                return {"status": "failed", "error": str(e)[:80]}
+
+        opts = {
+            **base_ydl,
+            "format": get_best_format(plat, "hd"),
+            "outtmpl": out_tmpl,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+                "Referer": "https://www.tiktok.com/",
+            },
+            "extractor_args": {
+                "tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"},
+            },
+        }
+        if plat == "youtube":
+            opts["extractor_args"] = {
+                "youtube": {"player_client": ["android", "tv_embedded"], "player_skip": ["webpage"]}
+            }
+            opts["http_headers"] = {
+                "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"
+            }
+
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(None, lambda o=opts: yt_dlp.YoutubeDL(o).extract_info(url, download=True))
+            matches = sorted(
+                [f for f in Path(vid_dir).iterdir() if f.is_file() and f.name.startswith(pfx)],
+                key=lambda f: f.stat().st_mtime, reverse=True,
+            )
+            if matches:
+                return {"status": "ok", "file": str(matches[0])}
+            return {"status": "failed", "error": "file not found"}
+        except Exception as e:
+            return {"status": "failed", "error": str(e)[:80]}
+
+    # Download in batches of 3 concurrently
+    results = []
+    for i in range(0, len(urls), 3):
+        batch = urls[i:i+3]
+        tasks = [dl_one(url, i+j) for j, url in enumerate(batch)]
+        batch_res = await asyncio.gather(*tasks)
+        results.extend(batch_res)
+
+    ok_files = [r["file"] for r in results if r.get("status") == "ok" and r.get("file")]
+    failed_count = len(urls) - len(ok_files)
+
+    if not ok_files:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise HTTPException(status_code=422, detail={
+            "error": "all_failed",
+            "message": f"Koi bhi video download nahi ho saki. Sab {len(urls)} failed.",
+        })
+
+    # Build ZIP in memory
+    zip_buf = io_module.BytesIO()
+    with zf_module.ZipFile(zip_buf, "w", zf_module.ZIP_DEFLATED, allowZip64=True) as zf:
+        for fpath_str in ok_files:
+            fpath = Path(fpath_str)
+            if fpath.exists():
+                arc_name = re.sub(r'[^\w\-. ]', '_', fpath.name)[:80]
+                zf.write(fpath, arc_name)
+
+    zip_bytes = zip_buf.getvalue()
+    zip_buf.close()
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    async def stream_zip():
+        MB = 1024 * 1024
+        for i in range(0, len(zip_bytes), MB):
+            yield zip_bytes[i:i+MB]
+
+    return StreamingResponse(
+        stream_zip(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{zip_filename}"',
+            "Content-Length": str(len(zip_bytes)),
+            "Access-Control-Allow-Origin": "*",
+            "X-Total": str(len(urls)),
+            "X-Success": str(len(ok_files)),
+            "X-Failed": str(failed_count),
+        },
+    )
