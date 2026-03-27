@@ -1,15 +1,7 @@
 """
-ContentCreator Pro Studio - FastAPI Backend v8
-Features:
-- Multi-platform download (Sora, TikTok, FB, IG, Twitter, Bilibili, Douyin, YouTube)
-- Quality selector (best/hd/sd)
-- Video metadata extraction
-- Thumbnail download
-- Caption/subtitle extraction
-- Video clipping (start/end time via ffmpeg)
-- Multi-clip export
-- Auto-rename with platform + date + title
-- CSV/Excel URL import support
+ContentCreator Pro Studio - FastAPI Backend v9
+All-platform profile bulk downloader + ZIP fix + YouTube fix
+Platforms: YouTube, TikTok, Instagram, Facebook, Twitter/X, Bilibili, Douyin, Sora
 """
 
 import asyncio
@@ -19,9 +11,9 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import urllib.parse
+import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -33,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="ContentCreator Pro Studio", version="8.0.0")
+app = FastAPI(title="ContentCreator Pro Studio", version="9.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -64,6 +56,16 @@ PLATFORM_NAMES = {
     "twitter": "Twitter/X", "bilibili": "Bilibili", "generic": "Video",
 }
 
+# Profile URL patterns for each platform
+PROFILE_PATTERNS = {
+    "youtube":   r"(?:youtube\.com/@|youtube\.com/(?:user|c|channel)/)([^/?&\s]+)",
+    "tiktok":    r"tiktok\.com/@([^/?&\s]+)",
+    "instagram": r"instagram\.com/([^/?&\s]+)/?$",
+    "twitter":   r"(?:twitter\.com|x\.com)/([^/?&\s]+)",
+    "bilibili":  r"space\.bilibili\.com/(\d+)|bilibili\.com/([^/?&\s]+)",
+    "facebook":  r"facebook\.com/([^/?&\s]+)",
+}
+
 
 def detect_platform(url: str) -> str:
     url_lower = url.lower()
@@ -87,9 +89,7 @@ def format_duration(seconds: float) -> str:
     h = int(seconds // 3600)
     m = int((seconds % 3600) // 60)
     s = int(seconds % 60)
-    if h:
-        return f"{h:02d}:{m:02d}:{s:02d}"
-    return f"{m:02d}:{s:02d}"
+    return f"{h:02d}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
 def is_ffmpeg_available() -> bool:
@@ -100,8 +100,7 @@ def smart_filename(title: str, platform: str, ext: str = "mp4") -> str:
     date = datetime.now().strftime("%Y%m%d")
     clean = re.sub(r'[^\w\s\-]', '', str(title or "video"))
     clean = re.sub(r'\s+', '_', clean.strip()).strip('_')[:40]
-    plat = platform.upper()[:8]
-    return f"{plat}_{date}_{clean}.{ext}"
+    return f"{platform.upper()[:8]}_{date}_{clean}.{ext}"
 
 
 def safe_filename(name: str, ext: str = "mp4") -> str:
@@ -114,56 +113,46 @@ def safe_filename(name: str, ext: str = "mp4") -> str:
     return name[:100]
 
 
-def get_best_format(platform: str, quality: str = "best") -> str:
-    ffmpeg = is_ffmpeg_available()
+def find_file(tmp_dir: str) -> Optional[Path]:
+    files = sorted(
+        [f for f in Path(tmp_dir).iterdir() if f.is_file()],
+        key=lambda f: f.stat().st_size, reverse=True,
+    )
+    return files[0] if files else None
 
-    if not ffmpeg:
+
+def find_files_by_prefix(directory: str, prefix: str) -> List[Path]:
+    return sorted(
+        [f for f in Path(directory).iterdir() if f.is_file() and f.name.startswith(prefix)],
+        key=lambda f: f.stat().st_mtime, reverse=True,
+    )
+
+
+# ─── Format selection ─────────────────────────────────────────────────
+
+def get_best_format(platform: str, quality: str = "best") -> str:
+    if not is_ffmpeg_available():
         return "best[ext=mp4]/best[ext=webm]/best"
 
     if platform in ("tiktok", "douyin"):
         return "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
 
     if platform == "youtube":
-        # Long fallback chain — yt-dlp tries each slash-separated option in order
-        q_yt = {
-            "4k": (
-                "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo[height<=2160]+bestaudio"
-                "/bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo[height<=1080]+bestaudio"
-                "/best[height<=2160]/best"
-            ),
-            "hd": (
-                "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo[height<=1080]+bestaudio"
-                "/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo[height<=720]+bestaudio"
-                "/best[height<=1080]/best"
-            ),
-            "sd": (
-                "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo[height<=480]+bestaudio"
-                "/bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo[height<=360]+bestaudio"
-                "/best[height<=480]/best"
-            ),
-            "best": (
-                "bestvideo[ext=mp4]+bestaudio[ext=m4a]"
-                "/bestvideo+bestaudio"
-                "/bestvideo[ext=mp4]+bestaudio"
-                "/best[ext=mp4]/best"
-            ),
+        q = {
+            "4k":   "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best",
+            "hd":   "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best",
+            "sd":   "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best",
+            "best": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         }
-        return q_yt.get(quality, q_yt["best"])
+        return q.get(quality, q["best"])
 
-    # All other platforms
-    quality_map = {
+    q_map = {
         "4k":   "bestvideo[height<=2160]+bestaudio/best",
         "hd":   "bestvideo[height<=1080]+bestaudio/best",
         "sd":   "bestvideo[height<=480]+bestaudio/best",
         "best": "bestvideo+bestaudio/best",
     }
-    return quality_map.get(quality, quality_map["best"])
+    return q_map.get(quality, q_map["best"])
 
 
 def build_ydl_opts(platform: str, out_path: str, quality: str = "best",
@@ -178,19 +167,13 @@ def build_ydl_opts(platform: str, out_path: str, quality: str = "best",
         "retries": 3,
         "noplaylist": True,
     }
-
     if subtitles:
-        opts.update({
-            "writesubtitles": True,
-            "writeautomaticsub": True,
-            "subtitlesformat": "srt",
-            "subtitleslangs": ["en", "ur", "hi", "auto"],
-        })
-
+        opts.update({"writesubtitles": True, "writeautomaticsub": True,
+                     "subtitlesformat": "srt", "subtitleslangs": ["en", "auto"]})
     if thumbnail:
         opts["writethumbnail"] = True
 
-    platform_extras = {
+    extras = {
         "tiktok": {
             "http_headers": {
                 "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
@@ -199,40 +182,89 @@ def build_ydl_opts(platform: str, out_path: str, quality: str = "best",
             "extractor_args": {"tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"}},
         },
         "youtube": {
-            # Use Android + TV client to bypass YouTube bot detection on server IPs
             "extractor_args": {
-                "youtube": {
-                    "player_client": ["android", "tv_embedded", "web"],
-                    "player_skip": ["webpage", "configs"],
-                }
+                "youtube": {"player_client": ["android", "tv_embedded"], "player_skip": ["webpage"]}
             },
-            "http_headers": {
-                "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
-            },
+            "http_headers": {"User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"},
         },
-        "facebook": {
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            },
-        },
-        "instagram": {
-            "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
-        },
-        "bilibili": {
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://www.bilibili.com/",
-            },
-        },
+        "facebook":  {"http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"}},
+        "instagram": {"http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}},
+        "twitter":   {"http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}},
+        "bilibili":  {"http_headers": {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"}},
+        "douyin":    {"http_headers": {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", "Referer": "https://www.douyin.com/"}},
     }
-
-    if platform in platform_extras:
-        opts.update(platform_extras[platform])
-
+    if platform in extras:
+        opts.update(extras[platform])
     return opts
 
 
-# ─── Sora Extractor ───────────────────────────────────────────────────
+# ─── yt-dlp runner with YouTube fallback chain ────────────────────────
+
+async def run_ydl(url: str, opts: dict) -> dict:
+    def _run(o):
+        with yt_dlp.YoutubeDL(o) as ydl:
+            return ydl.extract_info(url, download=True)
+
+    loop = asyncio.get_event_loop()
+    is_yt = "youtube.com" in url or "youtu.be" in url
+
+    try:
+        return await loop.run_in_executor(None, lambda: _run(opts))
+    except yt_dlp.utils.DownloadError as e:
+        err = str(e)
+
+        # ffmpeg missing
+        if "ffmpeg" in err.lower() or "merger" in err.lower():
+            fb = {**opts, "format": "best[ext=mp4]/best[ext=webm]/best", "merge_output_format": None}
+            try:
+                return await loop.run_in_executor(None, lambda: _run(fb))
+            except Exception as e2:
+                raise HTTPException(status_code=422, detail={"error": "ffmpeg_error", "message": str(e2)[:200]})
+
+        # YouTube bot / format errors
+        yt_err = any(k in err.lower() for k in ["sign in", "bot", "confirm", "not available", "requested format", "format"])
+        if is_yt and yt_err:
+            combos = [
+                (["android"],               "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"),
+                (["tv_embedded"],           "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"),
+                (["ios"],                   "bestvideo+bestaudio/best"),
+                (["android", "tv_embedded"],"bestvideo+bestaudio/best"),
+                (["mweb"],                  "best[ext=mp4]/best"),
+                (["android"],               "best"),
+                (["tv_embedded"],           "best"),
+            ]
+            for clients, fmt in combos:
+                try:
+                    yo = {
+                        **opts,
+                        "format": fmt,
+                        "extractor_args": {"youtube": {"player_client": clients, "player_skip": ["webpage"]}},
+                        "http_headers": {"User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"},
+                    }
+                    return await loop.run_in_executor(None, lambda o=yo: _run(o))
+                except Exception:
+                    continue
+            raise HTTPException(status_code=422, detail={
+                "error": "youtube_failed",
+                "message": "YouTube video download nahi ho saki. Age-restricted, private, ya region-locked ho sakti hai.",
+            })
+
+        raise HTTPException(status_code=422, detail={"error": "download_failed", "message": err[:300]})
+
+
+async def extract_info_only(url: str, platform: str) -> dict:
+    opts = {**build_ydl_opts(platform, "/dev/null"), "skip_download": True}
+    def _run():
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(None, _run)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail={"error": "info_failed", "message": str(e)[:300]})
+
+
+# ─── Sora extractor ───────────────────────────────────────────────────
 
 FLIFLIK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -290,117 +322,137 @@ async def resolve_sora(url: str) -> str:
     raise HTTPException(status_code=422, detail={"error": "sora_failed", "message": "Sora video extract nahi ho saki."})
 
 
-# ─── yt-dlp helpers ───────────────────────────────────────────────────
+# ─── Enhancement presets ──────────────────────────────────────────────
 
-async def run_ydl(url: str, opts: dict) -> dict:
-    def _run(o):
-        with yt_dlp.YoutubeDL(o) as ydl:
-            return ydl.extract_info(url, download=True)
-
-    loop = asyncio.get_event_loop()
-
-    is_youtube = "youtube.com" in url or "youtu.be" in url
-
-    try:
-        return await loop.run_in_executor(None, lambda: _run(opts))
-    except yt_dlp.utils.DownloadError as e:
-        err = str(e)
-
-        # ffmpeg missing — quick fix
-        if "ffmpeg" in err.lower() or "merger" in err.lower():
-            fallback = {**opts, "format": "best[ext=mp4]/best[ext=webm]/best", "merge_output_format": None}
-            try:
-                return await loop.run_in_executor(None, lambda: _run(fallback))
-            except Exception as e2:
-                raise HTTPException(status_code=422, detail={"error": "ffmpeg_error", "message": str(e2)[:300]})
-
-        # YouTube errors — bot detection OR format not available
-        # Both are fixed by trying different player clients + simpler formats
-        yt_errors = (
-            "sign in" in err.lower() or
-            "bot" in err.lower() or
-            "confirm" in err.lower() or
-            "not available" in err.lower() or
-            "requested format" in err.lower() or
-            "format" in err.lower()
-        )
-
-        if is_youtube and yt_errors:
-            # Try each client with progressively simpler formats
-            fallback_combos = [
-                # (clients, format)
-                (["android"],               "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"),
-                (["tv_embedded"],           "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"),
-                (["ios"],                   "bestvideo+bestaudio/best"),
-                (["android", "tv_embedded"],"bestvideo+bestaudio/best"),
-                (["mweb"],                  "best[ext=mp4]/best"),
-                (["android"],               "best"),
-                (["tv_embedded"],           "best"),
-            ]
-
-            for clients, fmt in fallback_combos:
-                try:
-                    yt_opts = {
-                        **opts,
-                        "format": fmt,
-                        "extractor_args": {
-                            "youtube": {
-                                "player_client": clients,
-                                "player_skip": ["webpage"],
-                            }
-                        },
-                        "http_headers": {
-                            "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
-                        },
-                    }
-                    return await loop.run_in_executor(None, lambda o=yt_opts: _run(o))
-                except yt_dlp.utils.DownloadError:
-                    continue
-                except Exception:
-                    continue
-
-            raise HTTPException(status_code=422, detail={
-                "error": "youtube_failed",
-                "message": "YouTube video download nahi ho saki. Video age-restricted, private, ya region-locked ho sakti hai.",
-                "platform": "youtube",
-            })
-
-        raise HTTPException(status_code=422, detail={"error": "download_failed", "message": err[:300]})
+ENHANCE_PRESETS = {
+    "light":     {"label": "Light Boost",    "vf": "unsharp=5:5:0.8:3:3:0.4,eq=contrast=1.05:saturation=1.1",                                                                     "crf": "20", "preset": "fast"},
+    "standard":  {"label": "Standard",       "vf": "hqdn3d=2:1.5:6:4.5,unsharp=5:5:1.2:3:3:0.6,scale=1920:1080:flags=lanczos,eq=contrast=1.08:saturation=1.15:gamma=0.95",       "crf": "18", "preset": "medium"},
+    "strong":    {"label": "Strong",         "vf": "hqdn3d=3:2.5:8:6,unsharp=7:7:1.5:5:5:0.8,scale=iw*2:ih*2:flags=lanczos,eq=contrast=1.12:saturation=1.2:gamma=0.92",          "crf": "16", "preset": "slow"},
+    "cinematic": {"label": "Cinematic",      "vf": "hqdn3d=2:1.5:5:4,unsharp=5:5:1.0:3:3:0.5,scale=1920:1080:flags=lanczos,eq=contrast=1.1:saturation=0.95:gamma=0.9,vignette=PI/5","crf":"17","preset":"medium"},
+}
 
 
-async def extract_info_only(url: str, platform: str) -> dict:
-    opts = {**build_ydl_opts(platform, "/dev/null"), "skip_download": True}
-    def _run():
+# ─── All-platform profile fetcher ────────────────────────────────────
+
+def parse_profile_input(raw: str, platform: str) -> str:
+    """Extract username/channel-id from any input format."""
+    raw = raw.strip()
+    pat = PROFILE_PATTERNS.get(platform)
+    if pat:
+        m = re.search(pat, raw, re.I)
+        if m:
+            return next(g for g in m.groups() if g)
+    # Strip @ and return as-is
+    return raw.lstrip('@').split('/')[0].split('?')[0]
+
+
+def build_profile_url(platform: str, identifier: str) -> str:
+    urls = {
+        "youtube":   f"https://www.youtube.com/@{identifier}/videos",
+        "tiktok":    f"https://www.tiktok.com/@{identifier}",
+        "instagram": f"https://www.instagram.com/{identifier}/",
+        "twitter":   f"https://twitter.com/{identifier}/media",
+        "bilibili":  f"https://space.bilibili.com/{identifier}/video" if identifier.isdigit() else f"https://www.bilibili.com/{identifier}",
+        "facebook":  f"https://www.facebook.com/{identifier}/videos",
+    }
+    return urls.get(platform, f"https://www.{platform}.com/{identifier}")
+
+
+PROFILE_YDL_OPTS = {
+    "youtube": {
+        "extractor_args": {"youtube": {"player_client": ["android", "tv_embedded"], "player_skip": ["webpage"]}},
+        "http_headers": {"User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"},
+    },
+    "tiktok": {
+        "http_headers": {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", "Referer": "https://www.tiktok.com/"},
+        "extractor_args": {"tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"}},
+    },
+    "instagram": {
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+    },
+    "twitter": {
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+    },
+    "facebook": {
+        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"},
+    },
+    "bilibili": {
+        "http_headers": {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"},
+    },
+}
+
+
+async def fetch_profile_videos(platform: str, identifier: str, max_videos: int = 50) -> List[dict]:
+    profile_url = build_profile_url(platform, identifier)
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": True,
+        "playlistend": max_videos,
+        **PROFILE_YDL_OPTS.get(platform, {}),
+    }
+
+    def _extract():
         with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=False)
+            info = ydl.extract_info(profile_url, download=False)
+            if not info:
+                return []
+            entries = info.get("entries") or []
+            videos = []
+            for entry in entries:
+                if not entry:
+                    continue
+                vid_url = (entry.get("url") or entry.get("webpage_url") or "")
+                if not vid_url and entry.get("id"):
+                    vid_id = entry["id"]
+                    url_map = {
+                        "youtube":   f"https://www.youtube.com/watch?v={vid_id}",
+                        "tiktok":    f"https://www.tiktok.com/@{identifier}/video/{vid_id}",
+                        "instagram": f"https://www.instagram.com/p/{vid_id}/",
+                        "twitter":   f"https://twitter.com/i/web/status/{vid_id}",
+                        "bilibili":  f"https://www.bilibili.com/video/{vid_id}",
+                    }
+                    vid_url = url_map.get(platform, "")
+                if not vid_url:
+                    continue
+                videos.append({
+                    "url": vid_url,
+                    "title": (entry.get("title") or "")[:100],
+                    "duration": entry.get("duration"),
+                    "duration_fmt": format_duration(entry.get("duration") or 0),
+                    "thumbnail": entry.get("thumbnail"),
+                    "view_count": entry.get("view_count"),
+                    "like_count": entry.get("like_count"),
+                    "upload_date": entry.get("upload_date", ""),
+                    "id": entry.get("id", ""),
+                    "platform": platform,
+                })
+            return videos
+
     loop = asyncio.get_event_loop()
     try:
-        return await loop.run_in_executor(None, _run)
+        return await loop.run_in_executor(None, _extract)
+    except yt_dlp.utils.DownloadError as e:
+        raise HTTPException(status_code=422, detail={
+            "error": "profile_fetch_failed",
+            "message": str(e)[:300],
+            "platform": platform,
+            "identifier": identifier,
+        })
     except Exception as e:
-        raise HTTPException(status_code=422, detail={"error": "info_failed", "message": str(e)[:300]})
-
-
-def find_file(tmp_dir: str) -> Optional[Path]:
-    files = sorted([f for f in Path(tmp_dir).iterdir() if f.is_file()],
-                   key=lambda f: f.stat().st_size, reverse=True)
-    return files[0] if files else None
+        raise HTTPException(status_code=500, detail=str(e)[:200])
 
 
 # ─── Routes ──────────────────────────────────────────────────────────
 
 @app.get("/")
 async def root():
-    return {
-        "name": "ContentCreator Pro Studio",
-        "version": "8.0.0",
-        "ffmpeg": is_ffmpeg_available(),
-        "platforms": list(PLATFORM_NAMES.values()),
-    }
+    return {"name": "ContentCreator Pro Studio", "version": "9.0.0", "ffmpeg": is_ffmpeg_available()}
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "8.0.0", "ffmpeg": is_ffmpeg_available()}
+    return {"status": "ok", "version": "9.0.0", "ffmpeg": is_ffmpeg_available()}
 
 
 @app.get("/detect")
@@ -409,75 +461,84 @@ async def detect_route(url: str = Query(...)):
     return {"platform": p, "platform_name": PLATFORM_NAMES.get(p, "Generic")}
 
 
-# ── Metadata endpoint ─────────────────────────────────────────────────
-@app.get("/metadata")
-async def get_metadata(url: str = Query(...)):
-    """Extract full metadata: title, description, hashtags, duration, thumbnail, formats."""
+# ── Profile fetch (ALL platforms) ────────────────────────────────────
+@app.get("/profile")
+async def profile_fetch(
+    url: str = Query(..., description="Profile URL or username — any platform"),
+    max_videos: int = Query(50, ge=1, le=200),
+):
+    """
+    Universal profile video fetcher.
+    Pass any profile URL or @username — auto-detects platform.
+    """
     url = url.strip()
     platform = detect_platform(url)
 
     if platform == "sora":
+        raise HTTPException(status_code=422, detail="Sora profile fetch not supported.")
+    if platform == "generic":
+        raise HTTPException(status_code=422, detail={
+            "error": "unknown_platform",
+            "message": "Platform pehchaana nahi gaya. YouTube/@username, TikTok/@username, instagram.com/username format use karein.",
+        })
+
+    identifier = parse_profile_input(url, platform)
+    if not identifier:
+        raise HTTPException(status_code=400, detail="Valid username ya profile URL chahiye.")
+
+    videos = await fetch_profile_videos(platform, identifier, max_videos)
+
+    if not videos:
+        raise HTTPException(status_code=404, detail={
+            "error": "no_videos",
+            "message": f"{PLATFORM_NAMES.get(platform)} @{identifier} ke koi public videos nahi mile. Account private ho sakta hai.",
+        })
+
+    return JSONResponse(content={
+        "platform": platform,
+        "platform_name": PLATFORM_NAMES.get(platform, "Generic"),
+        "identifier": identifier,
+        "profile_url": build_profile_url(platform, identifier),
+        "total_found": len(videos),
+        "videos": videos,
+    })
+
+
+# ── Metadata ──────────────────────────────────────────────────────────
+@app.get("/metadata")
+async def get_metadata(url: str = Query(...)):
+    url = url.strip()
+    platform = detect_platform(url)
+    if platform == "sora":
         video_url = await resolve_sora(url)
         sid = re.search(r'/p/(s_[a-f0-9]+)', url, re.I)
-        return {
-            "platform": "sora",
-            "platform_name": "Sora",
-            "title": f"Sora Video {sid.group(1) if sid else ''}",
-            "description": "",
-            "hashtags": [],
-            "duration": None,
-            "duration_fmt": None,
-            "thumbnail": None,
-            "uploader": "Sora / OpenAI",
-            "view_count": None,
-            "like_count": None,
-            "video_url": video_url,
-            "available_qualities": ["best"],
-        }
-
+        return {"platform": "sora", "platform_name": "Sora", "title": f"Sora Video {sid.group(1) if sid else ''}",
+                "description": "", "hashtags": [], "duration": None, "duration_fmt": None,
+                "thumbnail": None, "uploader": "Sora/OpenAI", "video_url": video_url, "available_qualities": ["best"]}
     info = await extract_info_only(url, platform)
-
-    # Extract hashtags from title + description + tags
-    tags = info.get("tags") or []
     desc = info.get("description") or ""
-    hashtags = list(set(
-        tags[:20] +
-        re.findall(r'#\w+', desc)[:20]
-    ))
-
-    # Available quality options
+    tags = info.get("tags") or []
+    hashtags = list(set(tags[:20] + re.findall(r'#\w+', desc)[:20]))
     formats = info.get("formats") or []
-    heights = sorted(set(
-        f.get("height") for f in formats
-        if f.get("height") and f.get("vcodec") != "none"
-    ), reverse=True)
+    heights = sorted(set(f.get("height") for f in formats if f.get("height") and f.get("vcodec") != "none"), reverse=True)
     qualities = []
     if any(h >= 2160 for h in heights): qualities.append("4k")
     if any(h >= 1080 for h in heights): qualities.append("hd")
     if any(h >= 480 for h in heights):  qualities.append("sd")
     if not qualities: qualities = ["best"]
-
-    duration = info.get("duration")
-
     return {
-        "platform": platform,
-        "platform_name": PLATFORM_NAMES.get(platform, "Generic"),
-        "title": info.get("title", ""),
-        "description": (desc[:500] + "...") if len(desc) > 500 else desc,
-        "hashtags": hashtags[:30],
-        "duration": duration,
-        "duration_fmt": format_duration(duration) if duration else None,
+        "platform": platform, "platform_name": PLATFORM_NAMES.get(platform, "Generic"),
+        "title": info.get("title", ""), "description": desc[:500] + ("..." if len(desc) > 500 else ""),
+        "hashtags": hashtags[:30], "duration": info.get("duration"),
+        "duration_fmt": format_duration(info.get("duration") or 0),
         "thumbnail": info.get("thumbnail"),
         "uploader": info.get("uploader") or info.get("channel") or "",
-        "view_count": info.get("view_count"),
-        "like_count": info.get("like_count"),
-        "upload_date": info.get("upload_date"),
-        "available_qualities": qualities,
-        "webpage_url": info.get("webpage_url", url),
+        "view_count": info.get("view_count"), "like_count": info.get("like_count"),
+        "upload_date": info.get("upload_date"), "available_qualities": qualities,
     }
 
 
-# ── Download endpoint ─────────────────────────────────────────────────
+# ── Download ──────────────────────────────────────────────────────────
 @app.get("/download")
 async def download_video(
     url: str = Query(...),
@@ -489,52 +550,38 @@ async def download_video(
     url = url.strip()
     platform = detect_platform(url)
 
-    # Sora
     if platform == "sora":
         video_url = await resolve_sora(url)
         sid = re.search(r'/p/(s_[a-f0-9]+)', url, re.I)
         out_filename = filename or smart_filename(f"sora_{sid.group(1) if sid else 'video'}", "sora")
-        resp_headers = {
-            "Content-Disposition": f'attachment; filename="{out_filename}"',
-            "Access-Control-Allow-Origin": "*",
-        }
+        resp_headers = {"Content-Disposition": f'attachment; filename="{out_filename}"', "Access-Control-Allow-Origin": "*"}
         try:
             async with httpx.AsyncClient(timeout=8, follow_redirects=True) as client:
                 head = await client.head(video_url, headers=VIDEO_HEADERS)
                 cl = head.headers.get("content-length")
-                if cl:
-                    resp_headers["Content-Length"] = cl
+                if cl: resp_headers["Content-Length"] = cl
         except Exception:
             pass
-
         async def sora_stream():
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=20.0, read=600.0, write=60.0, pool=10.0),
-                follow_redirects=True,
-            ) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=600.0, write=60.0, pool=10.0), follow_redirects=True) as client:
                 async with client.stream("GET", video_url, headers=VIDEO_HEADERS) as resp:
                     resp.raise_for_status()
                     async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
                         yield chunk
-
         return StreamingResponse(sora_stream(), media_type="video/mp4", headers=resp_headers)
 
-    # yt-dlp
     tmp_dir = tempfile.mkdtemp()
     tmp_path = os.path.join(tmp_dir, "video.%(ext)s")
-    opts = build_ydl_opts(platform, tmp_path, quality=quality,
-                          subtitles=subtitles, thumbnail=thumbnail)
+    opts = build_ydl_opts(platform, tmp_path, quality=quality, subtitles=subtitles, thumbnail=thumbnail)
     try:
         info = await run_ydl(url, opts)
         actual = find_file(tmp_dir)
         if not actual:
             raise HTTPException(status_code=500, detail="File not found after download.")
-
         title = info.get("title", "video") if info else "video"
         ext = actual.suffix.lstrip('.') or "mp4"
         out_filename = filename or smart_filename(title, platform, ext)
         file_size = actual.stat().st_size
-
         resp_headers = {
             "Content-Disposition": f'attachment; filename="{out_filename}"',
             "Content-Length": str(file_size),
@@ -542,62 +589,44 @@ async def download_video(
             "X-Video-Title": urllib.parse.quote(title[:100]),
             "X-Platform": platform,
         }
-
         async def file_stream():
             try:
                 with open(actual, "rb") as f:
                     while True:
                         chunk = f.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
+                        if not chunk: break
                         yield chunk
             finally:
-                try:
-                    actual.unlink(missing_ok=True)
-                    shutil.rmtree(tmp_dir, ignore_errors=True)
-                except Exception:
-                    pass
-
-        media_type = f"video/{ext}" if ext in ("mp4", "webm", "mov") else "video/mp4"
-        return StreamingResponse(file_stream(), media_type=media_type, headers=resp_headers)
-
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        return StreamingResponse(file_stream(), media_type="video/mp4", headers=resp_headers)
     except HTTPException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
     except Exception as e:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
         raise HTTPException(status_code=500, detail=str(e)[:300])
 
 
-# ── Clip endpoint ─────────────────────────────────────────────────────
+# ── Clip ──────────────────────────────────────────────────────────────
 @app.get("/clip")
 async def clip_video(
     url: str = Query(...),
-    start: str = Query(..., description="Start time: HH:MM:SS or seconds"),
-    end: str = Query(..., description="End time: HH:MM:SS or seconds"),
+    start: str = Query(...),
+    end: str = Query(...),
     quality: str = Query("hd"),
     filename: Optional[str] = Query(None),
 ):
-    """Download video and clip to start-end range using ffmpeg."""
     if not is_ffmpeg_available():
-        raise HTTPException(status_code=503, detail={
-            "error": "ffmpeg_not_available",
-            "message": "Clipping ke liye ffmpeg zaroori hai. nixpacks.toml check karein.",
-        })
-
+        raise HTTPException(status_code=503, detail={"error": "ffmpeg_not_available", "message": "ffmpeg zaroori hai."})
     url = url.strip()
     platform = detect_platform(url)
-
     tmp_dir = tempfile.mkdtemp()
     tmp_path = os.path.join(tmp_dir, "source.%(ext)s")
-
     try:
-        # Step 1: Download full video
         if platform == "sora":
             video_url = await resolve_sora(url)
             src_path = os.path.join(tmp_dir, "source.mp4")
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=20.0, read=600.0, write=60.0, pool=10.0),
-                follow_redirects=True,
-            ) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=600.0, write=60.0, pool=10.0), follow_redirects=True) as client:
                 async with client.stream("GET", video_url, headers=VIDEO_HEADERS) as resp:
                     resp.raise_for_status()
                     with open(src_path, "wb") as f:
@@ -609,65 +638,38 @@ async def clip_video(
             info = await run_ydl(url, opts)
             src_file = find_file(tmp_dir)
             if not src_file:
-                raise HTTPException(status_code=500, detail="Source video download failed.")
+                raise HTTPException(status_code=500, detail="Source download failed.")
             src_path = str(src_file)
             title = info.get("title", "video") if info else "video"
 
-        # Step 2: Clip with ffmpeg
         clip_path = os.path.join(tmp_dir, "clip.mp4")
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(start),
-            "-to", str(end),
-            "-i", src_path,
-            "-c:v", "libx264",
-            "-c:a", "aac",
-            "-avoid_negative_ts", "make_zero",
-            "-movflags", "+faststart",
-            clip_path,
-        ]
-
         proc = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+            "ffmpeg", "-y", "-ss", str(start), "-to", str(end), "-i", src_path,
+            "-c:v", "libx264", "-c:a", "aac", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", clip_path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await proc.communicate()
-
         if proc.returncode != 0:
-            raise HTTPException(status_code=500, detail={
-                "error": "clip_failed",
-                "message": stderr.decode()[-500:] if stderr else "ffmpeg error",
-            })
+            raise HTTPException(status_code=500, detail={"error": "clip_failed", "message": stderr.decode()[-300:] if stderr else "ffmpeg error"})
 
         clip_file = Path(clip_path)
         if not clip_file.exists() or clip_file.stat().st_size == 0:
-            raise HTTPException(status_code=500, detail="Clip file empty or not created.")
-
+            raise HTTPException(status_code=500, detail="Clip file empty.")
         out_filename = filename or smart_filename(f"{title}_clip_{start}-{end}".replace(":", "-"), platform)
-        file_size = clip_file.stat().st_size
-
         async def clip_stream():
             try:
                 with open(clip_file, "rb") as f:
                     while True:
                         chunk = f.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
+                        if not chunk: break
                         yield chunk
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-
-        return StreamingResponse(
-            clip_stream(),
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f'attachment; filename="{out_filename}"',
-                "Content-Length": str(file_size),
-                "Access-Control-Allow-Origin": "*",
-            },
-        )
-
+        return StreamingResponse(clip_stream(), media_type="video/mp4", headers={
+            "Content-Disposition": f'attachment; filename="{out_filename}"',
+            "Content-Length": str(clip_file.stat().st_size),
+            "Access-Control-Allow-Origin": "*",
+        })
     except HTTPException:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
@@ -676,45 +678,35 @@ async def clip_video(
         raise HTTPException(status_code=500, detail=str(e)[:300])
 
 
-# ── Multi-clip endpoint ───────────────────────────────────────────────
+# ── Multi-clip ────────────────────────────────────────────────────────
 class ClipSegment(BaseModel):
     start: str
     end: str
     label: Optional[str] = None
-
 
 class MultiClipRequest(BaseModel):
     url: str
     segments: List[ClipSegment]
     quality: str = "hd"
 
-
 @app.post("/multi-clip")
 async def multi_clip(request: MultiClipRequest):
-    """Download once, export multiple clips."""
     if not is_ffmpeg_available():
         raise HTTPException(status_code=503, detail="ffmpeg not available")
     if len(request.segments) > 20:
-        raise HTTPException(status_code=400, detail="Max 20 clips per request.")
-
+        raise HTTPException(status_code=400, detail="Max 20 clips.")
     url = request.url.strip()
     platform = detect_platform(url)
     tmp_dir = tempfile.mkdtemp()
     tmp_path = os.path.join(tmp_dir, "source.%(ext)s")
-
     try:
-        # Download once
         if platform == "sora":
             video_url = await resolve_sora(url)
             src_path = os.path.join(tmp_dir, "source.mp4")
-            async with httpx.AsyncClient(
-                timeout=httpx.Timeout(connect=20.0, read=600.0, write=60.0, pool=10.0),
-                follow_redirects=True,
-            ) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=600.0, write=60.0, pool=10.0), follow_redirects=True) as client:
                 async with client.stream("GET", video_url, headers=VIDEO_HEADERS) as resp:
                     with open(src_path, "wb") as f:
-                        async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
-                            f.write(chunk)
+                        async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE): f.write(chunk)
             title = "sora_clip"
         else:
             opts = build_ydl_opts(platform, tmp_path, quality=request.quality)
@@ -725,53 +717,22 @@ async def multi_clip(request: MultiClipRequest):
             src_path = str(src_file)
             title = info.get("title", "video") if info else "video"
 
-        # Export each clip
         results = []
         for i, seg in enumerate(request.segments):
             clip_name = seg.label or f"clip_{i+1}"
             clip_path = os.path.join(tmp_dir, f"{clip_name}.mp4")
-            cmd = [
-                "ffmpeg", "-y",
-                "-ss", str(seg.start),
-                "-to", str(seg.end),
-                "-i", src_path,
-                "-c:v", "libx264", "-c:a", "aac",
-                "-avoid_negative_ts", "make_zero",
-                "-movflags", "+faststart",
-                clip_path,
-            ]
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+            cmd = ["ffmpeg", "-y", "-ss", str(seg.start), "-to", str(seg.end), "-i", src_path,
+                   "-c:v", "libx264", "-c:a", "aac", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", clip_path]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
             _, stderr = await proc.communicate()
-
             if proc.returncode == 0 and Path(clip_path).exists():
-                results.append({
-                    "label": clip_name,
-                    "start": seg.start,
-                    "end": seg.end,
-                    "status": "ready",
-                    "size": Path(clip_path).stat().st_size,
-                    "size_human": format_bytes(Path(clip_path).stat().st_size),
-                    "download_path": clip_path,
-                })
+                results.append({"label": clip_name, "start": seg.start, "end": seg.end, "status": "ready",
+                                 "size_human": format_bytes(Path(clip_path).stat().st_size), "download_path": clip_path})
             else:
-                results.append({
-                    "label": clip_name,
-                    "start": seg.start,
-                    "end": seg.end,
-                    "status": "failed",
-                    "error": stderr.decode()[-200:] if stderr else "unknown",
-                })
-
-        return JSONResponse(content={
-            "title": title,
-            "platform": platform,
-            "total_clips": len(results),
-            "ready": sum(1 for r in results if r["status"] == "ready"),
-            "clips": results,
-            "tmp_dir": tmp_dir,
-        })
-
+                results.append({"label": clip_name, "start": seg.start, "end": seg.end, "status": "failed",
+                                 "error": stderr.decode()[-200:] if stderr else "unknown"})
+        return JSONResponse(content={"title": title, "platform": platform, "clips": results, "tmp_dir": tmp_dir,
+                                     "ready": sum(1 for r in results if r["status"] == "ready")})
     except HTTPException:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
@@ -782,244 +743,92 @@ async def multi_clip(request: MultiClipRequest):
 
 @app.get("/clip-file")
 async def get_clip_file(path: str = Query(...)):
-    """Stream a specific clip file that was prepared by multi-clip."""
     clip_file = Path(path)
-    if not clip_file.exists() or not clip_file.is_file():
+    if not clip_file.exists():
         raise HTTPException(status_code=404, detail="Clip file not found.")
-    file_size = clip_file.stat().st_size
-    out_filename = clip_file.name
-
     async def stream():
         try:
             with open(clip_file, "rb") as f:
                 while True:
                     chunk = f.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
+                    if not chunk: break
                     yield chunk
         finally:
-            try:
-                clip_file.unlink(missing_ok=True)
-            except Exception:
-                pass
-
+            clip_file.unlink(missing_ok=True)
     return StreamingResponse(stream(), media_type="video/mp4", headers={
-        "Content-Disposition": f'attachment; filename="{out_filename}"',
-        "Content-Length": str(file_size),
+        "Content-Disposition": f'attachment; filename="{clip_file.name}"',
+        "Content-Length": str(clip_file.stat().st_size),
         "Access-Control-Allow-Origin": "*",
     })
 
 
-# ── Enhance endpoint (Sora quality boost via ffmpeg) ─────────────────
-
-ENHANCE_PRESETS = {
-    "light": {
-        "label": "Light Boost",
-        "desc": "Subtle sharpening + contrast — fast",
-        "vf": "unsharp=5:5:0.8:3:3:0.4,eq=contrast=1.05:brightness=0.01:saturation=1.1",
-        "crf": "20",
-        "preset": "fast",
-    },
-    "standard": {
-        "label": "Standard Enhance",
-        "desc": "Denoise + sharpen + upscale to 1080p",
-        "vf": (
-            "hqdn3d=2:1.5:6:4.5,"
-            "unsharp=5:5:1.2:3:3:0.6,"
-            "scale=1920:1080:flags=lanczos,"
-            "eq=contrast=1.08:brightness=0.02:saturation=1.15:gamma=0.95"
-        ),
-        "crf": "18",
-        "preset": "medium",
-    },
-    "strong": {
-        "label": "Strong Enhance",
-        "desc": "Heavy denoise + sharpen + 4x upscale + color grade",
-        "vf": (
-            "hqdn3d=3:2.5:8:6,"
-            "unsharp=7:7:1.5:5:5:0.8,"
-            "scale=iw*2:ih*2:flags=lanczos,"
-            "eq=contrast=1.12:brightness=0.02:saturation=1.2:gamma=0.92,"
-            "unsharp=3:3:0.5:3:3:0.3"
-        ),
-        "crf": "16",
-        "preset": "slow",
-    },
-    "cinematic": {
-        "label": "Cinematic",
-        "desc": "Film-grade color + denoise + sharpness",
-        "vf": (
-            "hqdn3d=2:1.5:5:4,"
-            "unsharp=5:5:1.0:3:3:0.5,"
-            "scale=1920:1080:flags=lanczos,"
-            "eq=contrast=1.1:brightness=0.0:saturation=0.95:gamma=0.9,"
-            "curves=preset=lighter,"
-            "vignette=PI/5"
-        ),
-        "crf": "17",
-        "preset": "medium",
-    },
-}
-
-
+# ── Enhance ───────────────────────────────────────────────────────────
 @app.get("/enhance/presets")
 async def get_enhance_presets():
-    """Return available enhancement presets."""
-    return {
-        "presets": [
-            {"id": k, "label": v["label"], "desc": v["desc"]}
-            for k, v in ENHANCE_PRESETS.items()
-        ],
-        "ffmpeg_available": is_ffmpeg_available(),
-    }
+    return {"presets": [{"id": k, "label": v["label"]} for k, v in ENHANCE_PRESETS.items()],
+            "ffmpeg_available": is_ffmpeg_available()}
 
 
 @app.get("/enhance")
 async def enhance_video(
-    url: str = Query(..., description="Sora share URL"),
-    preset: str = Query("standard", description="light | standard | strong | cinematic"),
+    url: str = Query(...),
+    preset: str = Query("standard"),
     filename: Optional[str] = Query(None),
 ):
-    """
-    Download Sora video and enhance quality using ffmpeg filters.
-    Applies: denoise, sharpening, upscaling, color grading.
-    """
     if not is_ffmpeg_available():
-        raise HTTPException(status_code=503, detail={
-            "error": "ffmpeg_not_available",
-            "message": "ffmpeg zaroori hai enhancement ke liye. nixpacks.toml check karein.",
-        })
-
+        raise HTTPException(status_code=503, detail={"error": "ffmpeg_not_available", "message": "ffmpeg zaroori hai enhancement ke liye. nixpacks.toml check karein."})
     if preset not in ENHANCE_PRESETS:
         raise HTTPException(status_code=400, detail=f"Invalid preset. Use: {', '.join(ENHANCE_PRESETS)}")
-
     url = url.strip()
     config = ENHANCE_PRESETS[preset]
     tmp_dir = tempfile.mkdtemp()
-
     try:
-        # Step 1: Download original Sora video
         video_url = await resolve_sora(url)
         src_path = os.path.join(tmp_dir, "original.mp4")
-
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=20.0, read=600.0, write=60.0, pool=10.0),
-            follow_redirects=True,
-        ) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=600.0, write=60.0, pool=10.0), follow_redirects=True) as client:
             async with client.stream("GET", video_url, headers=VIDEO_HEADERS) as resp:
                 resp.raise_for_status()
                 with open(src_path, "wb") as f:
-                    async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
-                        f.write(chunk)
-
+                    async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE): f.write(chunk)
         if not Path(src_path).exists() or Path(src_path).stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Original video download failed.")
-
-        # Step 2: Get original video info
-        probe_cmd = [
-            "ffprobe", "-v", "quiet", "-print_format", "json",
-            "-show_streams", "-select_streams", "v:0", src_path,
-        ]
-        probe_proc = await asyncio.create_subprocess_exec(
-            *probe_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        probe_stdout, _ = await probe_proc.communicate()
-        orig_w, orig_h = 0, 0
-        try:
-            probe_data = json.loads(probe_stdout)
-            stream = probe_data.get("streams", [{}])[0]
-            orig_w = int(stream.get("width", 0))
-            orig_h = int(stream.get("height", 0))
-        except Exception:
-            pass
-
-        # Step 3: Build smart vf — don't upscale if already HD
-        vf = config["vf"]
-        if preset == "standard" and orig_h >= 1080:
-            # Already 1080p+ — skip upscale, just denoise+sharpen+color
-            vf = (
-                "hqdn3d=2:1.5:6:4.5,"
-                "unsharp=5:5:1.2:3:3:0.6,"
-                "eq=contrast=1.08:brightness=0.02:saturation=1.15:gamma=0.95"
-            )
-        elif preset == "strong" and orig_h >= 720:
-            # Already decent res — upscale 1.5x instead of 2x
-            vf = (
-                "hqdn3d=3:2.5:8:6,"
-                "unsharp=7:7:1.5:5:5:0.8,"
-                f"scale={max(orig_w, 1920)}:{max(orig_h, 1080)}:flags=lanczos,"
-                "eq=contrast=1.12:brightness=0.02:saturation=1.2:gamma=0.92"
-            )
-
-        # Step 4: Apply ffmpeg enhancement
         enhanced_path = os.path.join(tmp_dir, "enhanced.mp4")
-        ffmpeg_cmd = [
-            "ffmpeg", "-y",
-            "-i", src_path,
-            "-vf", vf,
-            "-c:v", "libx264",
-            "-crf", config["crf"],
-            "-preset", config["preset"],
-            "-c:a", "aac",
-            "-b:a", "192k",
-            "-movflags", "+faststart",
-            "-pix_fmt", "yuv420p",
-            enhanced_path,
-        ]
-
         proc = await asyncio.create_subprocess_exec(
-            *ffmpeg_cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
+            "ffmpeg", "-y", "-i", src_path,
+            "-vf", config["vf"], "-c:v", "libx264", "-crf", config["crf"],
+            "-preset", config["preset"], "-c:a", "aac", "-b:a", "192k",
+            "-movflags", "+faststart", "-pix_fmt", "yuv420p", enhanced_path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await proc.communicate()
-
         if proc.returncode != 0:
-            err_text = stderr.decode(errors="ignore")[-600:] if stderr else "ffmpeg error"
-            raise HTTPException(status_code=500, detail={
-                "error": "enhance_failed",
-                "message": err_text,
-            })
-
+            raise HTTPException(status_code=500, detail={"error": "enhance_failed", "message": stderr.decode()[-400:] if stderr else "ffmpeg error"})
         enhanced_file = Path(enhanced_path)
         if not enhanced_file.exists() or enhanced_file.stat().st_size == 0:
             raise HTTPException(status_code=500, detail="Enhanced file not created.")
-
-        # Build output filename
         sid = re.search(r'/p/(s_[a-f0-9]+)', url, re.I)
-        base_name = sid.group(1) if sid else "sora_video"
-        date_str = datetime.now().strftime("%Y%m%d")
-        out_filename = filename or f"SORA_{date_str}_{base_name}_{preset}_enhanced.mp4"
+        base = sid.group(1) if sid else "sora_video"
+        out_filename = filename or f"SORA_{datetime.now().strftime('%Y%m%d')}_{base}_{preset}_enhanced.mp4"
         out_filename = re.sub(r'[^\w\-.]', '_', out_filename)[:120]
-
         file_size = enhanced_file.stat().st_size
         orig_size = Path(src_path).stat().st_size
-
         async def enhanced_stream():
             try:
                 with open(enhanced_file, "rb") as f:
                     while True:
                         chunk = f.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
+                        if not chunk: break
                         yield chunk
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-
-        return StreamingResponse(
-            enhanced_stream(),
-            media_type="video/mp4",
-            headers={
-                "Content-Disposition": f'attachment; filename="{out_filename}"',
-                "Content-Length": str(file_size),
-                "Access-Control-Allow-Origin": "*",
-                "X-Original-Size": str(orig_size),
-                "X-Enhanced-Size": str(file_size),
-                "X-Preset": preset,
-                "X-Original-Resolution": f"{orig_w}x{orig_h}" if orig_w else "unknown",
-            },
-        )
-
+        return StreamingResponse(enhanced_stream(), media_type="video/mp4", headers={
+            "Content-Disposition": f'attachment; filename="{out_filename}"',
+            "Content-Length": str(file_size),
+            "Access-Control-Allow-Origin": "*",
+            "X-Original-Size": str(orig_size),
+            "X-Enhanced-Size": str(file_size),
+            "X-Preset": preset,
+        })
     except HTTPException:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
@@ -1028,10 +837,9 @@ async def enhance_video(
         raise HTTPException(status_code=500, detail=str(e)[:300])
 
 
-# ── Thumbnail endpoint ────────────────────────────────────────────────
+# ── Thumbnail ─────────────────────────────────────────────────────────
 @app.get("/thumbnail")
 async def get_thumbnail(url: str = Query(...)):
-    """Get thumbnail URL and optionally proxy it."""
     url = url.strip()
     platform = detect_platform(url)
     if platform == "sora":
@@ -1040,85 +848,51 @@ async def get_thumbnail(url: str = Query(...)):
     thumb_url = info.get("thumbnail")
     if not thumb_url:
         raise HTTPException(status_code=404, detail="Thumbnail not found.")
-
-    # Proxy the thumbnail
     async def thumb_stream():
         async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
             async with client.stream("GET", thumb_url) as resp:
-                async for chunk in resp.aiter_bytes(chunk_size=65536):
-                    yield chunk
-
+                async for chunk in resp.aiter_bytes(chunk_size=65536): yield chunk
     title = info.get("title", "thumbnail")
     fname = smart_filename(title, platform, "jpg")
     return StreamingResponse(thumb_stream(), media_type="image/jpeg", headers={
-        "Content-Disposition": f'attachment; filename="{fname}"',
-        "Access-Control-Allow-Origin": "*",
-    })
+        "Content-Disposition": f'attachment; filename="{fname}"', "Access-Control-Allow-Origin": "*"})
 
 
-# ── Subtitles endpoint ────────────────────────────────────────────────
+# ── Subtitles ─────────────────────────────────────────────────────────
 @app.get("/subtitles")
 async def get_subtitles(url: str = Query(...), lang: str = Query("en")):
-    """Extract subtitles/captions as text."""
     url = url.strip()
     platform = detect_platform(url)
     if platform == "sora":
         raise HTTPException(status_code=422, detail="Sora subtitles not supported.")
-
     tmp_dir = tempfile.mkdtemp()
     tmp_path = os.path.join(tmp_dir, "sub.%(ext)s")
-    opts = {
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-        "subtitlesformat": "srt",
-        "subtitleslangs": [lang, "en"],
-        "outtmpl": tmp_path,
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    def _run():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(url, download=True)
-
+    opts = {"skip_download": True, "writesubtitles": True, "writeautomaticsub": True,
+            "subtitlesformat": "srt", "subtitleslangs": [lang, "en"], "outtmpl": tmp_path, "quiet": True}
     loop = asyncio.get_event_loop()
     try:
-        info = await loop.run_in_executor(None, _run)
+        info = await loop.run_in_executor(None, lambda: yt_dlp.YoutubeDL(opts).extract_info(url, download=True))
     except Exception as e:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise HTTPException(status_code=422, detail=f"Subtitle extraction failed: {str(e)[:200]}")
-
-    # Find subtitle file
     sub_files = list(Path(tmp_dir).glob("*.srt")) + list(Path(tmp_dir).glob("*.vtt"))
     if not sub_files:
         shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=404, detail="No subtitles found for this video.")
-
+        raise HTTPException(status_code=404, detail="No subtitles found.")
     sub_content = sub_files[0].read_text(encoding="utf-8", errors="ignore")
     title = info.get("title", "subtitle") if info else "subtitle"
-    fname = smart_filename(title, platform, "srt")
     shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    return StreamingResponse(
-        iter([sub_content.encode("utf-8")]),
-        media_type="text/plain",
-        headers={
-            "Content-Disposition": f'attachment; filename="{fname}"',
-            "Access-Control-Allow-Origin": "*",
-        },
-    )
+    return StreamingResponse(iter([sub_content.encode("utf-8")]), media_type="text/plain", headers={
+        "Content-Disposition": f'attachment; filename="{smart_filename(title, platform, "srt")}"',
+        "Access-Control-Allow-Origin": "*"})
 
 
-# ── CSV/Excel URL import ──────────────────────────────────────────────
+# ── Import URLs ────────────────────────────────────────────────────────
 @app.post("/import-urls")
 async def import_urls(file: UploadFile = File(...)):
-    """Parse CSV or plain text file and return list of URLs."""
     content = await file.read()
     text = content.decode("utf-8", errors="ignore")
-
     urls = []
-    # Try CSV first
     try:
         reader = csv.reader(io.StringIO(text))
         for row in reader:
@@ -1128,34 +902,160 @@ async def import_urls(file: UploadFile = File(...)):
                     urls.append(cell)
     except Exception:
         pass
-
-    # Fallback: line by line
     if not urls:
         for line in text.splitlines():
             line = line.strip()
             if line.startswith("http"):
                 urls.append(line)
-
     if not urls:
         raise HTTPException(status_code=422, detail="Koi valid URL nahi mili file mein.")
-
-    # Detect platforms
     result = []
     for url in urls[:50]:
         p = detect_platform(url)
-        result.append({
-            "url": url,
-            "platform": p,
-            "platform_name": PLATFORM_NAMES.get(p, "Generic"),
-        })
-
+        result.append({"url": url, "platform": p, "platform_name": PLATFORM_NAMES.get(p, "Generic")})
     return JSONResponse(content={"urls": result, "total": len(result)})
+
+
+# ── ZIP Download (FIXED) ──────────────────────────────────────────────
+class ZipRequest(BaseModel):
+    urls: List[str]
+    username: str = "videos"
+    platform: str = "mixed"
+
+
+async def download_one_for_zip(url: str, idx: int, vid_dir: str) -> dict:
+    """Download a single video into vid_dir for ZIP packaging."""
+    platform = detect_platform(url)
+    pfx = str(idx + 1).zfill(3)
+
+    if platform == "sora":
+        try:
+            vurl = await resolve_sora(url)
+            out_path = os.path.join(vid_dir, f"{pfx}_sora_video.mp4")
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=10.0),
+                follow_redirects=True,
+            ) as client:
+                async with client.stream("GET", vurl, headers=VIDEO_HEADERS) as resp:
+                    resp.raise_for_status()
+                    with open(out_path, "wb") as f:
+                        async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
+                            f.write(chunk)
+            return {"status": "ok", "file": out_path}
+        except Exception as e:
+            return {"status": "failed", "error": str(e)[:80]}
+
+    # yt-dlp — use safe title in filename
+    out_tmpl = os.path.join(vid_dir, f"{pfx}_%(title).50s.%(ext)s")
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "format": get_best_format(platform, "hd"),
+        "outtmpl": out_tmpl,
+        "merge_output_format": "mp4" if is_ffmpeg_available() else None,
+        "socket_timeout": 30,
+        "retries": 2,
+        "noplaylist": True,
+        **PROFILE_YDL_OPTS.get(platform, {}),
+    }
+    if platform == "youtube":
+        opts["extractor_args"] = {"youtube": {"player_client": ["android", "tv_embedded"], "player_skip": ["webpage"]}}
+        opts["http_headers"] = {"User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"}
+
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(None, lambda o=opts: yt_dlp.YoutubeDL(o).extract_info(url, download=True))
+        # Find the file we just downloaded
+        matches = sorted(
+            [f for f in Path(vid_dir).iterdir() if f.is_file() and f.name.startswith(pfx)],
+            key=lambda f: f.stat().st_mtime, reverse=True,
+        )
+        if matches:
+            return {"status": "ok", "file": str(matches[0])}
+        return {"status": "failed", "error": "file not found after download"}
+    except Exception as e:
+        return {"status": "failed", "error": str(e)[:80]}
+
+
+@app.post("/download-zip")
+async def download_zip(request: ZipRequest):
+    """
+    Download multiple videos and return as a single ZIP file.
+    Fixed version: builds ZIP correctly in memory.
+    """
+    urls = [u.strip() for u in request.urls if u.strip()]
+    if not urls:
+        raise HTTPException(status_code=400, detail="Koi URL nahi di.")
+    if len(urls) > 50:
+        raise HTTPException(status_code=400, detail="Max 50 videos per ZIP.")
+
+    safe_user = re.sub(r'[^\w\-]', '_', request.username or "videos")[:30]
+    plat_label = re.sub(r'[^\w]', '', request.platform or "mixed").upper()[:10]
+    date_str = datetime.now().strftime("%Y%m%d_%H%M")
+    zip_filename = f"{plat_label}_{safe_user}_{date_str}_{len(urls)}videos.zip"
+
+    tmp_dir = tempfile.mkdtemp()
+    vid_dir = os.path.join(tmp_dir, "videos")
+    os.makedirs(vid_dir, exist_ok=True)
+
+    try:
+        # Download in batches of 3
+        results = []
+        for i in range(0, len(urls), 3):
+            batch = urls[i:i+3]
+            tasks = [download_one_for_zip(url, i+j, vid_dir) for j, url in enumerate(batch)]
+            batch_res = await asyncio.gather(*tasks)
+            results.extend(batch_res)
+
+        ok_files = [r["file"] for r in results if r.get("status") == "ok" and r.get("file")]
+        failed_count = len(urls) - len(ok_files)
+
+        if not ok_files:
+            raise HTTPException(status_code=422, detail={
+                "error": "all_failed",
+                "message": f"Koi bhi video download nahi ho saki. Errors: " +
+                           "; ".join(r.get("error","?") for r in results[:3]),
+            })
+
+        # Build ZIP in memory
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
+            for fpath_str in ok_files:
+                fpath = Path(fpath_str)
+                if fpath.exists() and fpath.stat().st_size > 0:
+                    arc_name = re.sub(r'[^\w\-. ]', '_', fpath.name)[:80]
+                    zf.write(str(fpath), arc_name)
+
+        zip_bytes = zip_buf.getvalue()
+        zip_buf.close()
+
+        if len(zip_bytes) < 100:
+            raise HTTPException(status_code=500, detail="ZIP file empty — videos download nahi huyi.")
+
+        async def stream_zip():
+            MB = 512 * 1024
+            for offset in range(0, len(zip_bytes), MB):
+                yield zip_bytes[offset:offset + MB]
+
+        return StreamingResponse(
+            stream_zip(),
+            media_type="application/zip",
+            headers={
+                "Content-Disposition": f'attachment; filename="{zip_filename}"',
+                "Content-Length": str(len(zip_bytes)),
+                "Access-Control-Allow-Origin": "*",
+                "X-Total": str(len(urls)),
+                "X-Success": str(len(ok_files)),
+                "X-Failed": str(failed_count),
+            },
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 # ── Batch info ────────────────────────────────────────────────────────
 class BatchRequest(BaseModel):
     urls: List[str]
-
 
 @app.post("/batch/info")
 async def batch_info(request: BatchRequest):
@@ -1164,295 +1064,5 @@ async def batch_info(request: BatchRequest):
     results = []
     for url in request.urls:
         p = detect_platform(url.strip())
-        results.append({
-            "url": url,
-            "platform": p,
-            "platform_name": PLATFORM_NAMES.get(p, "Generic"),
-            "status": "queued",
-        })
+        results.append({"url": url, "platform": p, "platform_name": PLATFORM_NAMES.get(p, "Generic"), "status": "queued"})
     return JSONResponse(content={"results": results, "total": len(results)})
-
-
-# ── TikTok Profile Bulk Fetcher ───────────────────────────────────────
-
-def clean_tiktok_username(raw: str) -> str:
-    """Accept @username, username, or full profile URL — return clean username."""
-    raw = raw.strip()
-    # Full URL: tiktok.com/@username or tiktok.com/@username/video/...
-    m = re.search(r'tiktok\.com/@([^/?&\s]+)', raw, re.I)
-    if m:
-        return m.group(1)
-    # @username
-    if raw.startswith('@'):
-        return raw.lstrip('@')
-    # Plain username
-    return raw.lstrip('@')
-
-
-TIKTOK_PROFILE_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.tiktok.com/",
-}
-
-
-async def fetch_tiktok_profile_videos(username: str, max_videos: int = 50) -> List[dict]:
-    """
-    Use yt-dlp to extract all video URLs from a TikTok user profile.
-    Returns list of {url, title, duration, thumbnail, view_count}
-    """
-    profile_url = f"https://www.tiktok.com/@{username}"
-
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "extract_flat": True,        # Don't download — just list
-        "playlistend": max_videos,   # Limit videos
-        "http_headers": {
-            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-            "Referer": "https://www.tiktok.com/",
-        },
-        "extractor_args": {
-            "tiktok": {
-                "api_hostname": "api22-normal-c-useast2a.tiktokv.com",
-            }
-        },
-    }
-
-    def _extract():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(profile_url, download=False)
-            if not info:
-                return []
-            # Playlist entries
-            entries = info.get("entries") or []
-            videos = []
-            for entry in entries:
-                if not entry:
-                    continue
-                vid_url = entry.get("url") or entry.get("webpage_url") or ""
-                if not vid_url:
-                    # Build from id
-                    vid_id = entry.get("id")
-                    if vid_id:
-                        vid_url = f"https://www.tiktok.com/@{username}/video/{vid_id}"
-                videos.append({
-                    "url": vid_url,
-                    "title": entry.get("title", "")[:100],
-                    "duration": entry.get("duration"),
-                    "duration_fmt": format_duration(entry.get("duration") or 0),
-                    "thumbnail": entry.get("thumbnail"),
-                    "view_count": entry.get("view_count"),
-                    "like_count": entry.get("like_count"),
-                    "upload_date": entry.get("upload_date", ""),
-                    "id": entry.get("id", ""),
-                })
-            return videos
-
-    loop = asyncio.get_event_loop()
-    try:
-        return await loop.run_in_executor(None, _extract)
-    except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=422, detail={
-            "error": "profile_fetch_failed",
-            "message": str(e)[:300],
-            "username": username,
-        })
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)[:200])
-
-
-@app.get("/tiktok/profile")
-async def tiktok_profile_fetch(
-    username: str = Query(..., description="TikTok @username or profile URL"),
-    max_videos: int = Query(50, ge=1, le=200, description="Max videos to fetch (1-200)"),
-):
-    """
-    Fetch all video URLs from a TikTok user profile.
-    Returns list of videos ready for bulk download.
-    """
-    clean_name = clean_tiktok_username(username)
-    if not clean_name:
-        raise HTTPException(status_code=400, detail="Valid TikTok username chahiye.")
-
-    videos = await fetch_tiktok_profile_videos(clean_name, max_videos)
-
-    if not videos:
-        raise HTTPException(status_code=404, detail={
-            "error": "no_videos_found",
-            "message": f"@{clean_name} ke koi public videos nahi mile. Account private ho sakta hai.",
-            "username": clean_name,
-        })
-
-    return JSONResponse(content={
-        "username": clean_name,
-        "profile_url": f"https://www.tiktok.com/@{clean_name}",
-        "total_found": len(videos),
-        "videos": videos,
-    })
-
-
-@app.get("/tiktok/download-all")
-async def tiktok_download_all_info(
-    username: str = Query(...),
-    max_videos: int = Query(50, ge=1, le=200),
-):
-    """
-    Quick endpoint — returns all video URLs from a profile
-    ready to be passed to /download one by one.
-    """
-    clean_name = clean_tiktok_username(username)
-    videos = await fetch_tiktok_profile_videos(clean_name, max_videos)
-    urls = [v["url"] for v in videos if v.get("url")]
-    return JSONResponse(content={
-        "username": clean_name,
-        "urls": urls,
-        "total": len(urls),
-    })
-
-
-# ── ZIP Download endpoint ─────────────────────────────────────────────
-
-class ZipRequest(BaseModel):
-    urls: List[str]
-    username: str = "videos"
-    platform: str = "tiktok"
-
-
-@app.post("/download-zip")
-async def download_zip(request: ZipRequest):
-    """
-    Download multiple videos and ZIP them into one file.
-    Max 50 videos. Works for TikTok, FB, IG, YouTube, Sora.
-    """
-    import zipfile as zf_module
-    import io as io_module
-
-    urls = [u.strip() for u in request.urls if u.strip()]
-    if not urls:
-        raise HTTPException(status_code=400, detail="Koi URL nahi di.")
-    if len(urls) > 50:
-        raise HTTPException(status_code=400, detail="Max 50 videos per ZIP.")
-
-    safe_user = re.sub(r'[^\w\-]', '_', request.username)[:30]
-    plat_label = (request.platform or "videos").upper()[:10]
-    date_str = datetime.now().strftime("%Y%m%d_%H%M")
-    zip_filename = f"{plat_label}_{safe_user}_{date_str}_{len(urls)}videos.zip"
-
-    tmp_dir = tempfile.mkdtemp()
-    vid_dir = os.path.join(tmp_dir, "videos")
-    os.makedirs(vid_dir, exist_ok=True)
-
-    base_ydl = {
-        "quiet": True,
-        "no_warnings": True,
-        "merge_output_format": "mp4" if is_ffmpeg_available() else None,
-        "socket_timeout": 30,
-        "retries": 2,
-        "noplaylist": True,
-    }
-
-    async def dl_one(url: str, idx: int) -> dict:
-        plat = detect_platform(url)
-        pfx = str(idx + 1).zfill(3)
-        out_tmpl = os.path.join(vid_dir, f"{pfx}_%(title).60s.%(ext)s")
-
-        if plat == "sora":
-            try:
-                vurl = await resolve_sora(url)
-                out_path = os.path.join(vid_dir, f"{pfx}_sora_video.mp4")
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(connect=20.0, read=300.0, write=60.0, pool=10.0),
-                    follow_redirects=True,
-                ) as client:
-                    async with client.stream("GET", vurl, headers=VIDEO_HEADERS) as resp:
-                        resp.raise_for_status()
-                        with open(out_path, "wb") as f:
-                            async for chunk in resp.aiter_bytes(chunk_size=CHUNK_SIZE):
-                                f.write(chunk)
-                return {"status": "ok", "file": out_path}
-            except Exception as e:
-                return {"status": "failed", "error": str(e)[:80]}
-
-        opts = {
-            **base_ydl,
-            "format": get_best_format(plat, "hd"),
-            "outtmpl": out_tmpl,
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
-                "Referer": "https://www.tiktok.com/",
-            },
-            "extractor_args": {
-                "tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"},
-            },
-        }
-        if plat == "youtube":
-            opts["extractor_args"] = {
-                "youtube": {"player_client": ["android", "tv_embedded"], "player_skip": ["webpage"]}
-            }
-            opts["http_headers"] = {
-                "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"
-            }
-
-        loop = asyncio.get_event_loop()
-        try:
-            await loop.run_in_executor(None, lambda o=opts: yt_dlp.YoutubeDL(o).extract_info(url, download=True))
-            matches = sorted(
-                [f for f in Path(vid_dir).iterdir() if f.is_file() and f.name.startswith(pfx)],
-                key=lambda f: f.stat().st_mtime, reverse=True,
-            )
-            if matches:
-                return {"status": "ok", "file": str(matches[0])}
-            return {"status": "failed", "error": "file not found"}
-        except Exception as e:
-            return {"status": "failed", "error": str(e)[:80]}
-
-    # Download in batches of 3 concurrently
-    results = []
-    for i in range(0, len(urls), 3):
-        batch = urls[i:i+3]
-        tasks = [dl_one(url, i+j) for j, url in enumerate(batch)]
-        batch_res = await asyncio.gather(*tasks)
-        results.extend(batch_res)
-
-    ok_files = [r["file"] for r in results if r.get("status") == "ok" and r.get("file")]
-    failed_count = len(urls) - len(ok_files)
-
-    if not ok_files:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        raise HTTPException(status_code=422, detail={
-            "error": "all_failed",
-            "message": f"Koi bhi video download nahi ho saki. Sab {len(urls)} failed.",
-        })
-
-    # Build ZIP in memory
-    zip_buf = io_module.BytesIO()
-    with zf_module.ZipFile(zip_buf, "w", zf_module.ZIP_DEFLATED, allowZip64=True) as zf:
-        for fpath_str in ok_files:
-            fpath = Path(fpath_str)
-            if fpath.exists():
-                arc_name = re.sub(r'[^\w\-. ]', '_', fpath.name)[:80]
-                zf.write(fpath, arc_name)
-
-    zip_bytes = zip_buf.getvalue()
-    zip_buf.close()
-    shutil.rmtree(tmp_dir, ignore_errors=True)
-
-    async def stream_zip():
-        MB = 1024 * 1024
-        for i in range(0, len(zip_bytes), MB):
-            yield zip_bytes[i:i+MB]
-
-    return StreamingResponse(
-        stream_zip(),
-        media_type="application/zip",
-        headers={
-            "Content-Disposition": f'attachment; filename="{zip_filename}"',
-            "Content-Length": str(len(zip_bytes)),
-            "Access-Control-Allow-Origin": "*",
-            "X-Total": str(len(urls)),
-            "X-Success": str(len(ok_files)),
-            "X-Failed": str(failed_count),
-        },
-    )
