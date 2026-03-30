@@ -347,100 +347,225 @@ def parse_profile_input(raw: str, platform: str) -> str:
 
 
 def build_profile_url(platform: str, identifier: str) -> str:
+    """Build the correct playlist/channel URL for each platform."""
+    ident = identifier.strip().lstrip('@')
     urls = {
-        "youtube":   f"https://www.youtube.com/@{identifier}/videos",
-        "tiktok":    f"https://www.tiktok.com/@{identifier}",
-        "instagram": f"https://www.instagram.com/{identifier}/",
-        "twitter":   f"https://twitter.com/{identifier}/media",
-        "bilibili":  f"https://space.bilibili.com/{identifier}/video" if identifier.isdigit() else f"https://www.bilibili.com/{identifier}",
-        "facebook":  f"https://www.facebook.com/{identifier}/videos",
+        "youtube":   [
+            f"https://www.youtube.com/@{ident}/videos",
+            f"https://www.youtube.com/c/{ident}/videos",
+            f"https://www.youtube.com/user/{ident}/videos",
+        ],
+        "tiktok":    [f"https://www.tiktok.com/@{ident}"],
+        "instagram": [f"https://www.instagram.com/{ident}/"],
+        "twitter":   [f"https://twitter.com/{ident}", f"https://x.com/{ident}"],
+        "bilibili":  [f"https://space.bilibili.com/{ident}/video"] if ident.isdigit()
+                     else [f"https://www.bilibili.com/@{ident}"],
+        "facebook":  [f"https://www.facebook.com/{ident}/videos"],
     }
-    return urls.get(platform, f"https://www.{platform}.com/{identifier}")
+    result = urls.get(platform, [f"https://www.{platform}.com/@{ident}"])
+    return result[0]  # Primary URL
 
 
 PROFILE_YDL_OPTS = {
     "youtube": {
-        "extractor_args": {"youtube": {"player_client": ["android", "tv_embedded"], "player_skip": ["webpage"]}},
-        "http_headers": {"User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip"},
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "tv_embedded"],
+                "player_skip": ["webpage"],
+            }
+        },
+        "http_headers": {
+            "User-Agent": "com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip",
+        },
     },
     "tiktok": {
-        "http_headers": {"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", "Referer": "https://www.tiktok.com/"},
-        "extractor_args": {"tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"}},
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Referer": "https://www.tiktok.com/",
+        },
+        "extractor_args": {
+            "tiktok": {"api_hostname": "api22-normal-c-useast2a.tiktokv.com"},
+        },
     },
     "instagram": {
-        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        },
     },
     "twitter": {
-        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        },
     },
     "facebook": {
-        "http_headers": {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"},
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        },
     },
     "bilibili": {
-        "http_headers": {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"},
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://www.bilibili.com/",
+        },
     },
 }
 
 
+def make_video_entry(entry: dict, platform: str, identifier: str) -> Optional[dict]:
+    """Convert a yt-dlp flat entry to our video dict."""
+    if not entry:
+        return None
+
+    # Try all possible URL fields
+    vid_url = (
+        entry.get("webpage_url") or
+        entry.get("url") or
+        entry.get("original_url") or
+        ""
+    )
+
+    # Build URL from ID if not found
+    if not vid_url or not vid_url.startswith("http"):
+        vid_id = entry.get("id", "")
+        if vid_id:
+            url_map = {
+                "youtube":   f"https://www.youtube.com/watch?v={vid_id}",
+                "tiktok":    f"https://www.tiktok.com/@{identifier}/video/{vid_id}",
+                "instagram": f"https://www.instagram.com/p/{vid_id}/",
+                "twitter":   f"https://twitter.com/i/web/status/{vid_id}",
+                "bilibili":  f"https://www.bilibili.com/video/{vid_id}",
+                "facebook":  f"https://www.facebook.com/video/{vid_id}",
+            }
+            vid_url = url_map.get(platform, "")
+
+    if not vid_url:
+        return None
+
+    title = (entry.get("title") or entry.get("description") or vid_url.split("/")[-1] or "Video")[:100]
+    # Skip "Private video", "Deleted video" etc
+    if title.lower() in ("private video", "deleted video", "[private]", "[deleted]"):
+        return None
+
+    return {
+        "url": vid_url,
+        "title": title,
+        "duration": entry.get("duration"),
+        "duration_fmt": format_duration(entry.get("duration") or 0),
+        "thumbnail": entry.get("thumbnail") or entry.get("thumbnails", [{}])[-1].get("url") if entry.get("thumbnails") else None,
+        "view_count": entry.get("view_count"),
+        "like_count": entry.get("like_count"),
+        "upload_date": entry.get("upload_date", ""),
+        "id": entry.get("id", ""),
+        "platform": platform,
+    }
+
+
 async def fetch_profile_videos(platform: str, identifier: str, max_videos: int = 50) -> List[dict]:
+    """
+    Fetch all public videos from a user profile using yt-dlp.
+    Uses extract_flat=True for speed — only gets URLs/metadata, no download.
+    """
+    identifier = identifier.strip().lstrip('@')
     profile_url = build_profile_url(platform, identifier)
+
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "extract_flat": True,
+        "extract_flat": "in_playlist",   # Better than True — works for nested playlists
         "playlistend": max_videos,
+        "ignoreerrors": True,             # Skip private/deleted videos
+        "age_limit": None,
         **PROFILE_YDL_OPTS.get(platform, {}),
     }
 
-    def _extract():
+    def _extract(url: str) -> list:
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(profile_url, download=False)
+            info = ydl.extract_info(url, download=False)
             if not info:
                 return []
+
             entries = info.get("entries") or []
+
+            # Handle nested playlists (YouTube sometimes returns playlist of playlists)
+            flat = []
+            for e in entries:
+                if not e:
+                    continue
+                if e.get("_type") == "playlist" and e.get("entries"):
+                    flat.extend(e["entries"])
+                else:
+                    flat.append(e)
+
             videos = []
-            for entry in entries:
-                if not entry:
-                    continue
-                vid_url = (entry.get("url") or entry.get("webpage_url") or "")
-                if not vid_url and entry.get("id"):
-                    vid_id = entry["id"]
-                    url_map = {
-                        "youtube":   f"https://www.youtube.com/watch?v={vid_id}",
-                        "tiktok":    f"https://www.tiktok.com/@{identifier}/video/{vid_id}",
-                        "instagram": f"https://www.instagram.com/p/{vid_id}/",
-                        "twitter":   f"https://twitter.com/i/web/status/{vid_id}",
-                        "bilibili":  f"https://www.bilibili.com/video/{vid_id}",
-                    }
-                    vid_url = url_map.get(platform, "")
-                if not vid_url:
-                    continue
-                videos.append({
-                    "url": vid_url,
-                    "title": (entry.get("title") or "")[:100],
-                    "duration": entry.get("duration"),
-                    "duration_fmt": format_duration(entry.get("duration") or 0),
-                    "thumbnail": entry.get("thumbnail"),
-                    "view_count": entry.get("view_count"),
-                    "like_count": entry.get("like_count"),
-                    "upload_date": entry.get("upload_date", ""),
-                    "id": entry.get("id", ""),
-                    "platform": platform,
-                })
+            for entry in flat[:max_videos]:
+                v = make_video_entry(entry, platform, identifier)
+                if v:
+                    videos.append(v)
             return videos
 
     loop = asyncio.get_event_loop()
+
+    # Try primary URL
     try:
-        return await loop.run_in_executor(None, _extract)
-    except yt_dlp.utils.DownloadError as e:
-        raise HTTPException(status_code=422, detail={
-            "error": "profile_fetch_failed",
-            "message": str(e)[:300],
-            "platform": platform,
-            "identifier": identifier,
-        })
+        videos = await loop.run_in_executor(None, lambda: _extract(profile_url))
+        if videos:
+            return videos
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)[:200])
+        last_err = str(e)
+
+    # Fallback URLs for YouTube
+    if platform == "youtube":
+        fallback_urls = [
+            f"https://www.youtube.com/c/{identifier}/videos",
+            f"https://www.youtube.com/user/{identifier}/videos",
+            f"https://www.youtube.com/@{identifier}",
+        ]
+        for fb_url in fallback_urls:
+            if fb_url == profile_url:
+                continue
+            try:
+                videos = await loop.run_in_executor(None, lambda u=fb_url: _extract(u))
+                if videos:
+                    return videos
+            except Exception:
+                continue
+
+    # Fallback for TikTok — try without extractor_args
+    if platform == "tiktok":
+        simple_opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "playlistend": max_videos,
+            "ignoreerrors": True,
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            },
+        }
+        try:
+            videos = await loop.run_in_executor(
+                None, lambda: yt_dlp.YoutubeDL(simple_opts).extract_info(
+                    f"https://www.tiktok.com/@{identifier}", download=False
+                )
+            )
+            if videos and videos.get("entries"):
+                result = []
+                for e in (videos.get("entries") or [])[:max_videos]:
+                    v = make_video_entry(e, platform, identifier)
+                    if v:
+                        result.append(v)
+                if result:
+                    return result
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=422, detail={
+        "error": "profile_fetch_failed",
+        "message": f"{PLATFORM_NAMES.get(platform, platform)} @{identifier} se videos nahi mile. Check karein: 1) Account public hai? 2) Username sahi hai? 3) Videos hain?",
+        "platform": platform,
+        "identifier": identifier,
+        "profile_url": profile_url,
+    })
 
 
 # ─── Routes ──────────────────────────────────────────────────────────
@@ -464,22 +589,25 @@ async def detect_route(url: str = Query(...)):
 # ── Profile fetch (ALL platforms) ────────────────────────────────────
 @app.get("/profile")
 async def profile_fetch(
-    url: str = Query(..., description="Profile URL or username — any platform"),
+    url: str = Query(..., description="Profile URL or @username — any platform"),
     max_videos: int = Query(50, ge=1, le=200),
 ):
     """
     Universal profile video fetcher.
-    Pass any profile URL or @username — auto-detects platform.
+    Accepts full profile URL or bare @username (with platform= param).
     """
     url = url.strip()
     platform = detect_platform(url)
 
     if platform == "sora":
         raise HTTPException(status_code=422, detail="Sora profile fetch not supported.")
+
+    # If platform unknown — treat as YouTube (most common) or raise
     if platform == "generic":
+        # Maybe it's a bare username? Not much we can do without platform context
         raise HTTPException(status_code=422, detail={
             "error": "unknown_platform",
-            "message": "Platform pehchaana nahi gaya. YouTube/@username, TikTok/@username, instagram.com/username format use karein.",
+            "message": "Platform URL paste karein — e.g. youtube.com/@channel, tiktok.com/@user, instagram.com/user",
         })
 
     identifier = parse_profile_input(url, platform)
@@ -491,7 +619,7 @@ async def profile_fetch(
     if not videos:
         raise HTTPException(status_code=404, detail={
             "error": "no_videos",
-            "message": f"{PLATFORM_NAMES.get(platform)} @{identifier} ke koi public videos nahi mile. Account private ho sakta hai.",
+            "message": f"{PLATFORM_NAMES.get(platform)} @{identifier} ke koi public videos nahi mile. Account private ho sakta hai ya videos nahi hain.",
         })
 
     return JSONResponse(content={
